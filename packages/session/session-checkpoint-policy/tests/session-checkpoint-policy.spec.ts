@@ -1,37 +1,26 @@
+import { executeToolFixture } from '@deepseek-ai/dsh-tool-testkit'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { afterEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import { agentEvents, type Agent } from '@deepseek-ai/dsh-agent'
 import LlmRuntime, { ToolCallId, type GenerateOptions, LlmAdapter, type StreamChunk } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
-import type { SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
-import SessionPersistence from '@deepseek-ai/dsh-session-persistence'
+import SessionPersistence, { type SessionHandle, type SessionPersistenceSnapshot } from '@deepseek-ai/dsh-session-persistence'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime, { TOOL_ABORTED_BEFORE_DISPATCH } from '@deepseek-ai/dsh-tools'
 import * as checkpointPolicy from '../src/index.ts'
 
 const contexts: Context[] = []
 
+// The policy only requires the service's presence; it flushes through
+// `ctx.sessions`, so no handle is ever opened in these tests.
 class TestPersistence extends SessionPersistence {
-  override readonly supportsRawArtifacts = false
-
-  locate(_meta: SessionHeader): undefined { return undefined }
-  create(_meta: SessionHeader): Promise<void> { return Promise.resolve() }
-  append(_id: SessionId, _events: readonly SessionEvent[]): Promise<void> { return Promise.resolve() }
-  load(_id: SessionId): Promise<{ meta: SessionHeader; events: SessionEvent[] }> {
-    return Promise.reject(new Error('not used'))
-  }
-  inspect(_id: SessionId): Promise<{ meta: SessionHeader; events: SessionEvent[] }> {
-    return Promise.reject(new Error('not used'))
-  }
-  borrowSession(_id: SessionId, _signal?: AbortSignal): ReturnType<SessionPersistence['borrowSession']> {
-    return Promise.reject(new Error('not used'))
-  }
-  readFrom(_id: SessionId, _fromSeq: number): Promise<{ meta: SessionHeader; events: SessionEvent[] }> {
-    return Promise.reject(new Error('not used'))
-  }
-  list(): Promise<SessionHeader[]> { return Promise.resolve([]) }
-  listSnapshots(): Promise<never[]> { return Promise.resolve([]) }
+  create(): Promise<SessionHandle> { return Promise.reject(new Error('not used')) }
+  open(): Promise<SessionHandle> { return Promise.reject(new Error('not used')) }
+  flush(): Promise<void> { return Promise.resolve() }
+  stat(): Promise<SessionPersistenceSnapshot | undefined> { return Promise.resolve(undefined) }
+  list(): Promise<readonly SessionPersistenceSnapshot[]> { return Promise.resolve([]) }
 }
 
 class RecordingAdapter extends LlmAdapter {
@@ -49,6 +38,7 @@ async function setup(): Promise<Context> {
   await ctx.plugin(LlmRuntime)
   await ctx.plugin(SystemPrompt)
   await ctx.plugin(ToolRuntime)
+  await ctx.plugin(NativeToolExecutor)
   await ctx.plugin(TestPersistence)
   await ctx.plugin(checkpointPolicy)
   return ctx
@@ -120,14 +110,17 @@ describe('session-checkpoint-policy request boundary', () => {
 })
 
 describe('session-checkpoint-policy tool and step boundaries', () => {
-  it('awaits the checkpoint before a top-level tool body', async () => {
+  it('awaits the checkpoint before a top-level tool body', async ({ onTestFinished }) => {
     const ctx = await setup()
     const session = ctx.sessions.create(SessionId('tool-checkpoint'))
     const agent = { session } as Agent
     const gate = Promise.withResolvers<undefined>()
+    onTestFinished(() => { gate.resolve(undefined) })
+    const entered = Promise.withResolvers<undefined>()
     const order: string[] = []
     ctx.on('session/flush', async () => {
       order.push('flush:start')
+      entered.resolve(undefined)
       await gate.promise
       order.push('flush:end')
     })
@@ -137,26 +130,29 @@ describe('session-checkpoint-policy tool and step boundaries', () => {
       execute: async () => { order.push('tool'); return null },
     })
 
-    const pending = ctx.tools.execute({
+    const pending = executeToolFixture(ctx, {
       callId: ToolCallId('write-1'), name: 'write', arguments: {}, agent,
       signal: new AbortController().signal,
     })
-    await Promise.resolve()
+    await entered.promise
     expect(order).toEqual(['flush:start'])
     gate.resolve(undefined)
     await expect(pending).resolves.toMatchObject({ isError: false })
     expect(order).toEqual(['flush:start', 'flush:end', 'tool'])
   })
 
-  it('does not dispatch when cancellation lands during the tool checkpoint', async () => {
+  it('does not dispatch when cancellation lands during the tool checkpoint', async ({ onTestFinished }) => {
     const ctx = await setup()
     const session = ctx.sessions.create(SessionId('tool-checkpoint-cancel'))
     const agent = { session } as Agent
     const controller = new AbortController()
     const gate = Promise.withResolvers<undefined>()
+    onTestFinished(() => { gate.resolve(undefined) })
+    const entered = Promise.withResolvers<undefined>()
     const order: string[] = []
     ctx.on('session/flush', async () => {
       order.push('flush:start')
+      entered.resolve(undefined)
       await gate.promise
       order.push('flush:end')
     })
@@ -166,11 +162,11 @@ describe('session-checkpoint-policy tool and step boundaries', () => {
       execute: async () => { order.push('tool'); return null },
     })
 
-    const pending = ctx.tools.execute({
+    const pending = executeToolFixture(ctx, {
       callId: ToolCallId('write-cancelled'), name: 'write', arguments: {}, agent,
       signal: controller.signal,
     })
-    await Promise.resolve()
+    await entered.promise
     expect(order).toEqual(['flush:start'])
     controller.abort('cancelled during checkpoint')
     gate.resolve(undefined)
@@ -197,7 +193,7 @@ describe('session-checkpoint-policy tool and step boundaries', () => {
       output: { schema: { type: 'null' }, render: () => [] },
       execute: async () => { ran = true; return null },
     })
-    const result = await ctx.tools.execute({
+    const result = await executeToolFixture(ctx, {
       callId: ToolCallId('write-2'), name: 'write', arguments: {}, agent,
       signal: new AbortController().signal,
     })
@@ -217,7 +213,7 @@ describe('session-checkpoint-policy tool and step boundaries', () => {
       output: { schema: { type: 'null' }, render: () => [] },
       execute: async () => null,
     })
-    await ctx.tools.execute({
+    await executeToolFixture(ctx, {
       callId: ToolCallId('nested-1'), name: 'nested', arguments: {}, agent,
       parent: Symbol('outer') as never,
       signal: new AbortController().signal,
@@ -233,7 +229,7 @@ describe('session-checkpoint-policy tool and step boundaries', () => {
     ctx.on('session/flush', (current) => { flushed.push(current.id) })
     const signal = new AbortController().signal
     await agentEvents(ctx, agent).waterfall(
-      'agent/pre-step', { messages: [], turn: 1, step: 1, signal },
+      'agent/pre-step', { modelSelection: { provider: 'mock', model: 'mock' }, messages: [], turn: 1, step: 1, signal },
       () => Promise.resolve({ kind: 'enter', messages: [] }),
     )
     expect(flushed).toEqual([session.id])
@@ -248,6 +244,7 @@ describe('session-checkpoint-policy lifecycle', () => {
     await ctx.plugin(LlmRuntime)
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime)
+    await ctx.plugin(NativeToolExecutor)
     await ctx.plugin(TestPersistence)
     const session = ctx.sessions.create(SessionId('disposed-policy'))
     let flushes = 0

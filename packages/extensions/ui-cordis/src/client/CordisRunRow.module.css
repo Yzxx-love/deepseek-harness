@@ -31,6 +31,7 @@
   height: 2px;
   margin: 0 8px;
   border-radius: 50%;
+  corner-shape: round;
   background: var(--dsw-alias-state-business-primary);
 }
 
@@ -81,19 +82,25 @@
   padding: 0;
   border: none;
   border-radius: 999px;
+  corner-shape: round;
   background: transparent;
   color: var(--dsw-alias-label-tertiary);
   cursor: pointer;
   opacity: 0;
 }
 
-.card:hover .inspect,
 .inspect:focus-visible {
   opacity: 1;
 }
 
-.inspect:hover {
-  background: var(--dsw-alias-interactive-bg-hover);
+@media (hover: hover) {
+  .card:hover .inspect {
+    opacity: 1;
+  }
+
+  .inspect:hover {
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
 }
 
 .message {
@@ -108,7 +115,7 @@
 .business {
   min-width: 0;
   overflow: hidden;
-  border: 1px solid var(--dsw-alias-border-l2);
+  border: 0.5px solid var(--dsw-alias-border-l4);
   border-radius: 12px;
   background: var(--dsw-alias-bg-base);
 }
@@ -117,7 +124,7 @@
   margin: 0;
   padding: 10px 12px;
   overflow: auto;
-  border: 1px solid var(--dsw-alias-border-l2);
+  border: 0.5px solid var(--dsw-alias-border-l4);
   border-radius: 8px;
   background: var(--dsw-alias-markdown-code-block);
   color: var(--dsw-alias-label-secondary);
@@ -129,4 +136,10 @@
 .business .output {
   border: none;
   border-radius: 0;
+}
+
+@media (hover: none) {
+  .inspect {
+    opacity: 1;
+  }
 }

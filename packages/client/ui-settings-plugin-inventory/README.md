@@ -1,5 +1,5 @@
 ---
-description: "Read-only Cordis Loader inventory tab in Web Plugins settings for the dsh web client: searchable plugin catalog with enablement state and configuration."
+description: "Scope-grouped read-only plugin inventory tab in Web Plugins settings for the dsh web client: agent-preset compositions first, the global plane behind a disclosure, search across both."
 kind: "package-reference"
 ---
 
@@ -9,7 +9,7 @@ English | [中文](README.zh.md)
 
 ## Summary
 
-`dsh-client-ui-settings-plugin-inventory` contributes the read-only **Plugin list** tab to the Web Settings Plugins section. The tab lazily calls `ctx.remote.pluginInventory.list()` the first time it is selected and renders a searchable two-column catalog of compact disclosure cards: each collapsed card shows the short module name, an effective-enablement tag, and (for enabled entries) a colored root-fiber status dot; expanding a card reveals the Loader-tree entry id, effective configuration, and Cordis status. Loading, empty, no-match, and generic failure states stay local to the mounted component, and a failed read can be retried without exposing transport details.
+The **Plugin list** tab lets Web users inspect plugins without changing their configuration. It lists agent presets, open by default, then the collapsed global inventory; a search opens both. Cards show localized titles and descriptions when available, identify instances by stable entry id, and expose enablement, source details, runtime status, disabled conditions, and discovery failures; preset-provided global entries name their presets. Search covers both groups and points to matches in other presets. The tab handles loading, empty, no-match, failure, and retry states without exposing transport details, and still shows the global inventory without a preset roster.
 
 ## Table of Contents
 
@@ -27,13 +27,25 @@ English | [中文](README.zh.md)
 
 Open the Plugins section in Settings and select the **Plugin list** tab to inspect the Host's plugin inventory. The tab reads no Remote during plugin activation — selecting it for the first time mounts the component and lazily calls `ctx.remote.pluginInventory.list()` through `api-remotes`.
 
+A failed installation with pending pnpm build permissions offers **Allow these scripts and retry**. The action displays the exact package names and persistent permission scope, then retries the original package spec and activation choice. One click approves the entire displayed group, which can include pending packages from earlier attempts. Closing the page grants no permission.
+
 ### Reading a card
 
-Each collapsed card uses the short module name as its title and a small effective-enablement tag; enabled entries also show a colored root-fiber status dot. Expanding one card reveals its Loader-tree entry id, followed by the effective configuration and, for enabled entries, Cordis status; disabled entries omit the redundant unmounted runtime state. Search filters the catalog by name and entry id.
+Each collapsed card uses the plugin's localized title and description when available; a description shows at most two lines until its card is expanded. Settings shortens literal package-name or module-name fallbacks by removing the npm scope and the `cordis:`, `cordis-plugin-`, or `dsh-`/`dsh-host-`/`dsh-client-` prefix; locale titles remain unchanged. The Host supplies locale and package-field fallbacks in `meta`; the Client selects the current language. Full module specifiers remain available in details and search. Missing descriptions are omitted, and metadata diagnostics appear with the card. This compact naming applies only to Settings, not the sidebar's Plugins page.
+
+A small enablement tag marks only the states that differ from plainly enabled: disabled, conditional, provided by presets, and failed; a plainly enabled row carries no tag. A colored root-fiber status dot marks the live phases no tag states: `pending` maps to idle, while `loading` and `unloading` map to ongoing; an `active` or `failed` fiber shows no dot. The stable entry id appears in a code chip at the card's bottom-left, in line with the title, only when it differs from the title: a composition-generated id drops its leading `include:` marker there, and an id that then repeats the title is omitted. Whenever the chip shows, its hover text and the card's accessible name carry the complete id; search and expanded details always retain it. Long entry ids truncate in the chip and remain available on hover. Expanding one card reveals its full description, the declared entry id, the full module specifier, and the state facts: a preset row names the preset it comes from, its runtime status when the composition is live, and its disable condition when it carries one; a preset-provided global row explains that agent presets provide it per session, names the presets that enable it. Preset names resolve through the shared `presetDisplayText` fold (`dsh-agent-preset-registry/display`) over [`ui-agent-preset`](../ui-agent-preset/README.md)'s dictionaries: shipped presets follow the active locale while user-authored ones keep their own metadata, so an English surface never echoes the preset declarations' Chinese names. Search filters both groups by localized title and description, module name, and entry id.
+
+A card paints its hover surface only where the pointer can hover: a tap answers with the pressed fill, and an expanded card keeps its open surface on every device. The search field takes a 16px face under a coarse pointer, so iOS Safari does not zoom the page for a focused field.
+
+### The preset switcher
+
+The switcher is the same selector-pill-plus-menu control the General settings rows use. It lists every roster preset — the default suffixed as such, broken ones marked — and changes only what the list shows: it writes no settings, and selecting a broken preset shows the discovery-reported reason in place of rows. Choosing the default preset or a session's preset stays where it was: the Agent presets section and the new-session screen.
 
 ### Retrying a failed read
 
-A failed read renders a generic failure state inside the tab; retrying re-runs the lazy `list()` call without exposing transport details.
+A failed read renders the shared error marker inside the tab. Loading shows skeleton cards in the card grid, and current-page synchronization uses the shared ongoing loader. Retrying re-runs the lazy `list()` call without exposing transport details.
+
+The Plugin list also shows synchronization failures on the current page. Its retry reapplies the latest client graph without changing Host enablement or refreshing the page.
 
 -----
 
@@ -51,7 +63,7 @@ The browser plugin registers one localized `settings.plugins.tab` contribution w
 
 ### Rendering
 
-The entry id remains the React key, disclosure identity, detail value, and an additional search target; it is never classified by string shape.
+Row keys are scope-qualified (`global:`, `preset:<id>:<index>`), so one module appearing in both scopes keeps distinct disclosure state; a declared entry id appears in expanded details and, after removal of a leading composition `include:` marker, supplies the collapsed id chip when the result differs from the title, while a row without one stays unlabeled. The preset-provided marking is derived client-side: a global entry carries it when it is disabled there while at least one preset row for the same module specifier is actually enabled, so a module every preset gates off (or declares only conditionally) stays plainly disabled rather than over-claiming provision.
 
 </details>
 
@@ -86,7 +98,7 @@ None; this package neither assembles nor sends a provider request.
 These limits define the freshness and reach of the inventory view; they are current package constraints.
 
 - **One snapshot per Settings mount or retry** — the tab does not subscribe to Loader changes or automatically refetch after reconnect; switching tabs preserves the current snapshot, while reopening Settings obtains a new one.
-- **Read-only Loader view** — local search does not add provenance, current-browser activation diagnosis, grouping by source, or plugin mutation controls.
+- **Read-only in both planes** — the tab shows global and preset enablement but mutates neither; enable/disable controls that write a custom preset's own composition file are deliberate follow-up work.
 
 <a id="dev-note"></a>
 ### Dev Note

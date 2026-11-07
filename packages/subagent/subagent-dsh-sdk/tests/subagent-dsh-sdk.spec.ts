@@ -1,3 +1,4 @@
+import { mountWorkingDirectoryFixture } from '../../subagent/tests/working-directory-fixture.ts'
 /**
  * Keyless integration tests for the SDK subagent backend. Each spawns a REAL
  * subprocess — the SDK client package's scripted fake runtime — and drives it
@@ -6,18 +7,19 @@
  * quiescent disposal are all exercised end to end. No model, no key.
  */
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { startExternalActivation } from '../../subagent/tests/external-activation-helpers.ts'
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import SubagentRuntime from '@deepseek-ai/dsh-subagent'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import type { Agent, AgentOptions } from '@deepseek-ai/dsh-agent'
 import {
   DeepSeekHarness,
   HarnessClient,
-  HarnessSession,
   SdkProtocolError,
 } from '@deepseek-ai/dsh-sdk-client'
 import { createProcessDeepSeekHarness } from '../../../sdk/client/src/api.ts'
@@ -37,7 +39,7 @@ import {
 
 const fakeRuntime = fileURLToPath(new URL('../../../sdk/client/tests/fake-runtime.ts', import.meta.url))
 const existingPatch = fileURLToPath(new URL(
-  './fixtures/loader/child.cordis.yml',
+  './fixtures/loader/child.patch.yml',
   import.meta.url,
 ))
 const defaultCreateHarness = runInternals.createHarness.bind(runInternals)
@@ -67,7 +69,7 @@ afterEach(() => {
   runInternals.createHarness = defaultCreateHarness
 })
 
-/** A parent Agent stub. The SDK backend reads exactly one thing off it: the session header's cwd (the workspace its child inherits). */
+/** Parent identity and immutable origin supplied to the activation fixture. */
 const fakeParent = { id: 'parent', session: { header: { cwd: process.cwd() } } } as unknown as Agent
 
 function request(text = 'p', signal = new AbortController().signal, agentOptions?: AgentOptions) {
@@ -83,6 +85,8 @@ function request(text = 'p', signal = new AbortController().signal, agentOptions
 /** Mount the SDK backend pointed at the fake runtime, scripted by `fakeEnv`. */
 async function setup(fakeEnv: Record<string, string> = {}, config: Partial<sdk.Config> = {}) {
   const ctx = new Context()
+  await ctx.plugin(SessionProjectionRegistry)
+  await mountWorkingDirectoryFixture(ctx)
   await ctx.plugin(SubagentRuntime)
   // The Config type models the post-validation shape, so the default registry
   // name is stated here; the Loader-composition fixture omits providerName and
@@ -100,7 +104,7 @@ async function setup(fakeEnv: Record<string, string> = {}, config: Partial<sdk.C
   return ctx
 }
 
-function text(blocks: { type: string; text?: string }[]): string {
+function text(blocks: readonly { type: string; text?: string }[]): string {
   return blocks.filter(b => b.type === 'text').map(b => b.text).join('')
 }
 
@@ -111,9 +115,9 @@ function expectedFailure(fields: string): string {
 /**
  * Poll until `file` exists (the fake touches it once the probed state is
  * reached), so cancel tests wait on a CONDITION rather than an arbitrary
- * timeout. Fails loud if the child never signals readiness.
+ * timeout. The caller supplies the lane's effective test budget.
  */
-async function waitForFile(file: string, timeoutMs = 5000): Promise<void> {
+async function waitForFile(file: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (!existsSync(file)) {
     if (Date.now() > deadline) throw new Error(`fake runtime never became ready (${file})`)
@@ -159,8 +163,8 @@ describe('dsh-subagent-dsh-sdk provider', () => {
 
   it('runs a child turn end to end with a parent-unique run id', async () => {
     const ctx = await setup({ FAKE_TEXT: 'hello from sdk child' })
-    const run = await ctx.subagents.start('dsh-sdk', request('do X'))
-    expect(run.localAgent).toBeUndefined()
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request('do X'))
+    expect(ctx.sessions.get(run.childId)).toBeUndefined()
     const result = await run.result
     expect(result.stopReason).toBe('completed')
     expect(result.diagnostic).toBeUndefined()
@@ -170,8 +174,8 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     expect(run.dispose()).toBe(disposal)
     await disposal
 
-    const nextRun = await ctx.subagents.start('dsh-sdk', request('again'))
-    expect(nextRun.id).not.toBe(run.id)
+    const nextRun = await startExternalActivation(ctx, 'dsh-sdk', request('again'))
+    expect(nextRun.childId).not.toBe(run.childId)
     await nextRun.result
     await nextRun.dispose()
     await ctx.fiber.dispose()
@@ -182,7 +186,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
       dshBin: relative(process.cwd(), fakeRuntime),
       patches: [relative(process.cwd(), existingPatch)],
     })
-    const run = await ctx.subagents.start('dsh-sdk', request())
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request())
     expect(text((await run.result).output)).toBe('explicit dsh child')
     expect(createdHarnessOptions[0]).toMatchObject({
       dshBin: fakeRuntime,
@@ -197,7 +201,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     const recordFile = join(tmp, 'init.jsonl')
     try {
       const ctx = await setup({ FAKE_RECORD_INIT: recordFile }, { maxTokens: 4096 })
-      const run = await ctx.subagents.start('dsh-sdk', request())
+      const run = await startExternalActivation(ctx, 'dsh-sdk', request())
       await run.result
       await run.dispose()
       const { readFileSync } = await import('node:fs')
@@ -219,7 +223,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     const recordFile = join(tmp, 'init.jsonl')
     try {
       const ctx = await setup({ FAKE_RECORD_INIT: recordFile }, { maxTokens: 4096 })
-      const run = await ctx.subagents.start('dsh-sdk', request('partial', new AbortController().signal, {
+      const run = await startExternalActivation(ctx, 'dsh-sdk', request('partial', new AbortController().signal, {
         reasoningEffort: ReasoningEffortId('high'),
       }))
       await run.result
@@ -244,13 +248,13 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     try {
       const ctx = await setup({ FAKE_RECORD_INIT: recordFile }, { maxTokens: 4096 })
       const runs = await Promise.all([
-        ctx.subagents.start('dsh-sdk', request('first', new AbortController().signal, {
+        startExternalActivation(ctx, 'dsh-sdk', request('first', new AbortController().signal, {
           provider: 'provider-a',
           model: 'model-a',
           reasoningEffort: ReasoningEffortId('high'),
           maxTokens: 111,
         })),
-        ctx.subagents.start('dsh-sdk', request('second', new AbortController().signal, {
+        startExternalActivation(ctx, 'dsh-sdk', request('second', new AbortController().signal, {
           provider: 'provider-b',
           model: 'model-b',
           reasoningEffort: ReasoningEffortId('max'),
@@ -293,7 +297,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
         DEEPSEEK_API_KEY: 'explicit-child-key',
         FAKE_TEXT: 'done',
       })
-      const run = await ctx.subagents.start('dsh-sdk', request())
+      const run = await startExternalActivation(ctx, 'dsh-sdk', request())
       const result = await run.result
       const answer = text(result.output)
       expect(answer).toContain('DSH_TEST_AMBIENT_SECRET_KEY=\n')
@@ -307,7 +311,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
 
   it('maps a max-tokens child turn end', async () => {
     const ctx = await setup({ FAKE_REASON_KIND: 'max-tokens', FAKE_STATUS: 'error' })
-    const run = await ctx.subagents.start('dsh-sdk', request())
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request())
     const result = await run.result
     expect(result.stopReason).toBe('max-tokens')
     expect(result.diagnostic).toBeUndefined()
@@ -317,7 +321,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
 
   it('flattens a child turn error into stopReason error and keeps partial text', async () => {
     const ctx = await setup({ FAKE_REASON_KIND: 'error', FAKE_STATUS: 'error', FAKE_TEXT: 'partial answer' })
-    const run = await ctx.subagents.start('dsh-sdk', request())
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request())
     const result = await run.result
     expect(result.stopReason).toBe('error')
     expect(result.diagnostic).toBe(
@@ -328,9 +332,9 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     await ctx.fiber.dispose()
   })
 
-  it('keeps streamed text when a malformed final message prevents completion', async () => {
+  it('keeps durable attempt text when a malformed final message prevents completion', async () => {
     const ctx = await setup({ FAKE_MALFORMED_MESSAGE: '1', FAKE_TEXT: 'stream-only answer' })
-    const run = await ctx.subagents.start('dsh-sdk', request())
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request())
     const result = await run.result
 
     expect(result.stopReason).toBe('error')
@@ -341,7 +345,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
 
   it('classifies a malformed child turn reason as a protocol failure', async () => {
     const ctx = await setup({ FAKE_MALFORMED_REASON: '1', FAKE_TEXT: 'partial before bad reason' })
-    const run = await ctx.subagents.start('dsh-sdk', request())
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request())
     const result = await run.result
 
     expect(result).toEqual({
@@ -353,13 +357,12 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     await ctx.fiber.dispose()
   })
 
-  it('keeps streamed text when the terminal message is an empty usage-only step', async () => {
-    // The child streams its answer, then emits an empty-content
-    // assistant/message (the harness loop appends one to host usage on a
-    // max-tokens step that assembled no text blocks). The empty message is
-    // not assistant output and must not erase the streamed answer.
+  it('keeps durable attempt text when the terminal message is an empty usage-only step', async () => {
+    // A prior attempt retained its text without a surface message; the next
+    // max-tokens attempt commits only an empty usage anchor. The empty message
+    // is not Assistant output and must not erase the durable attempt fallback.
     const ctx = await setup({ FAKE_EMPTY_MESSAGE: '1', FAKE_REASON_KIND: 'max-tokens' })
-    const run = await ctx.subagents.start('dsh-sdk', request())
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request())
     const result = await run.result
     expect(result.stopReason).toBe('max-tokens')
     expect(text(result.output)).toBe('hello from fake runtime')
@@ -369,7 +372,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
 
   it('reports a settled-without-turn child as an error', async () => {
     const ctx = await setup({ FAKE_REASON_KIND: 'none', FAKE_STATUS: 'error' })
-    const run = await ctx.subagents.start('dsh-sdk', request())
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request())
     expect(await run.result).toMatchObject({
       stopReason: 'error',
       diagnostic: expectedFailure('stage: session-run; category: missing-terminal'),
@@ -380,7 +383,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
 
   it('maps a blocked child turn to the shared refusal stop reason', async () => {
     const ctx = await setup({ FAKE_REASON_KIND: 'blocked' })
-    const run = await ctx.subagents.start('dsh-sdk', request())
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request())
     const result = await run.result
     expect(result.stopReason).toBe('refusal')
     expect(result.diagnostic).toBeUndefined()
@@ -397,7 +400,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     })
     try {
       const ctx = await setup({ FAKE_MALFORMED: '1' })
-      const error = await ctx.subagents.start('dsh-sdk', request()).catch((cause: unknown) => cause)
+      const error = await startExternalActivation(ctx, 'dsh-sdk', request()).catch((cause: unknown) => cause)
       expect(error).toBeInstanceOf(AggregateError)
       expect((error as Error).message).toBe(
         `subagent-dsh-sdk: ${expectedFailure('stage: initialize; category: protocol')}; `
@@ -475,7 +478,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
 
   it('preserves a disposed child cancellation without treating it as local cancellation', async () => {
     const ctx = await setup({ FAKE_REASON_KIND: 'aborted', FAKE_ABORT_REASON_KIND: 'disposed' })
-    const run = await ctx.subagents.start('dsh-sdk', request())
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request())
     const result = await run.result
     expect(result.stopReason).toBe('aborted')
     expect(result.diagnostic).toBe(
@@ -487,7 +490,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
 
   it('keeps an ordinary child abort diagnostic-free', async () => {
     const ctx = await setup({ FAKE_REASON_KIND: 'aborted', FAKE_ABORT_REASON_KIND: 'user' })
-    const run = await ctx.subagents.start('dsh-sdk', request())
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request())
     const result = await run.result
     expect(result.stopReason).toBe('aborted')
     expect(result.diagnostic).toBeUndefined()
@@ -498,7 +501,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
   it('uses a fixed fallback for an unknown child terminal reason', async () => {
     const rawReason = 'private/path/SECRET_TOKEN'
     const ctx = await setup({ FAKE_REASON_KIND: rawReason })
-    const run = await ctx.subagents.start('dsh-sdk', request())
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request())
     const result = await run.result
     expect(result.stopReason).toBe('error')
     expect(result.diagnostic).toBe(
@@ -509,11 +512,11 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     await ctx.fiber.dispose()
   })
 
-  it('aborting the required signal settles a hung child as aborted', async () => {
+  it('disposing the activation settles a hung child as aborted', async () => {
     const ctx = await setup({ FAKE_HANG_PROMPT: '1' }, { disposeEofGraceMs: 200, disposeGraceMs: 200 })
     const controller = new AbortController()
-    const run = await ctx.subagents.start('dsh-sdk', request('p', controller.signal))
-    controller.abort('test')
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request('p', controller.signal))
+    void run.dispose()
     const result = await run.result
     expect(result.stopReason).toBe('aborted')
     expect(result.diagnostic).toBeUndefined()
@@ -523,7 +526,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     await ctx.fiber.dispose()
   })
 
-  it('cancelling between handshake and publish rejects start after reap', async () => {
+  it('cancelling between handshake and publish rejects start after reap', async ({ task }) => {
     // The abort lands while the child is INSIDE initialize (ready-file
     // handshake window): the fake touches READY, we abort, then GO lets the
     // handshake complete — so the post-race `flags.cancelled` recheck must
@@ -531,6 +534,8 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     const tmp = mkdtempSync(join(tmpdir(), 'subagent-dsh-sdk-midcancel-'))
     const ready = join(tmp, 'ready')
     const go = join(tmp, 'go')
+    const createHarness = runInternals.createHarness.bind(runInternals)
+    runInternals.createHarness = options => createHarness({ ...options, initializeTimeoutMs: task.timeout })
     try {
       const controller = new AbortController()
       const spec: SdkRunSpec = {
@@ -546,12 +551,24 @@ describe('dsh-subagent-dsh-sdk provider', () => {
         disposeGraceMs: 200,
       }
       const pending = startSdkRun(request('p', controller.signal), spec)
-      await waitForFile(ready)
-      controller.abort('mid-handshake')
-      const { writeFileSync } = await import('node:fs')
-      writeFileSync(go, 'go\n')
-      await expect(pending).rejects.toThrow('aborted before the SDK child started')
+      // Observe failed startup while readiness is pending; rollback owns the child.
+      const settled = pending.then(
+        run => ({ kind: 'started' as const, run }),
+        (error: unknown) => ({ kind: 'failed' as const, error }),
+      )
+      try {
+        await waitForFile(ready, task.timeout)
+        controller.abort('mid-handshake')
+        writeFileSync(go, 'go\n')
+        await expect(pending).rejects.toThrow('aborted before the SDK child started')
+      } finally {
+        controller.abort('test cleanup')
+        writeFileSync(go, 'go\n')
+        const outcome = await settled
+        if (outcome.kind === 'started') await outcome.run.dispose()
+      }
     } finally {
+      runInternals.createHarness = createHarness
       rmSync(tmp, { recursive: true, force: true })
     }
   })
@@ -561,7 +578,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     // needed to establish this run's durable inbox receipt. The text therefore
     // lies outside an owned activity interval and cannot become its output.
     const ctx = await setup({ FAKE_STREAM_THEN_MALFORMED: '1' }, { shutdownTimeoutMs: 100, disposeEofGraceMs: 200, disposeGraceMs: 200 })
-    const run = await ctx.subagents.start('dsh-sdk', request())
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request())
     const result = await run.result
     expect(result.stopReason).toBe('error')
     expect(result.diagnostic).toBe(
@@ -579,7 +596,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
       FAKE_TEXT: 'partial before transport exit',
       FAKE_STDERR: stderr,
     })
-    const run = await ctx.subagents.start('dsh-sdk', request())
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request())
     const result = await run.result
     expect(result.stopReason).toBe('error')
     expect(result.output).toEqual([{ type: 'text', text: 'partial before transport exit' }])
@@ -593,11 +610,11 @@ describe('dsh-subagent-dsh-sdk provider', () => {
 
   it('uses a fixed unknown category for an untyped SDK exception', async () => {
     const rawMessage = 'unknown SDK failure at /private/path SECRET_TOKEN'
-    const spy = vi.spyOn(HarnessSession.prototype, 'run')
+    const spy = vi.spyOn(HarnessClient.prototype, 'prompt')
       .mockRejectedValue(new Error(rawMessage))
     try {
       const ctx = await setup()
-      const run = await ctx.subagents.start('dsh-sdk', request())
+      const run = await startExternalActivation(ctx, 'dsh-sdk', request())
       const result = await run.result
       expect(result.diagnostic).toBe(
         expectedFailure('stage: session-run; category: unknown'),
@@ -619,9 +636,11 @@ describe('dsh-subagent-dsh-sdk provider', () => {
       provider: 'p',
       model: 'm',
       env: { FAKE_REASON_KIND: reason },
-      shutdownTimeoutMs: 100,
-      disposeEofGraceMs: 200,
-      disposeGraceMs: 200,
+      // Product-default dispose budgets: two real children are reaped under
+      // runner contention, where tight windows misreport slow SIGKILL reaps.
+      shutdownTimeoutMs: DEFAULT_SHUTDOWN_TIMEOUT_MS,
+      disposeEofGraceMs: DEFAULT_DISPOSE_EOF_GRACE_MS,
+      disposeGraceMs: DEFAULT_DISPOSE_GRACE_MS,
     })
     const [errored, unknown] = await Promise.all([start('error'), start('unknown-reason')])
     const [errorResult, unknownResult] = await Promise.all([errored.result, unknown.result])
@@ -634,7 +653,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
 
   it('dispose cancels a hung child locally and reaps it', async () => {
     const ctx = await setup({ FAKE_HANG_PROMPT: '1' }, { shutdownTimeoutMs: 100, disposeEofGraceMs: 200, disposeGraceMs: 200 })
-    const run = await ctx.subagents.start('dsh-sdk', request())
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request())
     await run.dispose()
     expect((await run.result).stopReason).toBe('aborted')
     await ctx.fiber.dispose()
@@ -667,24 +686,48 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     }
   })
 
-  it('rejects a pre-aborted request through the registered provider before cwd resolution', async () => {
+  it('rejects a pre-aborted provider request before resolving the parent directory', async () => {
     const ctx = await setup()
     const controller = new AbortController()
     controller.abort()
     const parent = { id: 'parent', session: { header: {} } } as unknown as Agent
-    await expect(ctx.subagents.start('dsh-sdk', {
+    const provider = ctx.subagents.getProvider('dsh-sdk')!
+    await expect(Promise.resolve().then(() => provider.start!({
       label: 'p',
       prompt: [{ type: 'text' as const, text: 'p' }],
       parent,
+      cwd: process.cwd(),
       signal: controller.signal,
-    })).rejects.toThrow('subagent request was aborted before the SDK child started')
+    }))).rejects.toThrow('aborted before the SDK child started')
     await ctx.fiber.dispose()
+  })
+
+  it('rejects a child directory removed after resolution without starting a runtime', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'subagent-dsh-sdk-removed-cwd-'))
+    const ctx = await setup()
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => {})
+    try {
+      const resolved = {
+        ...request(),
+        cwd,
+
+      }
+      rmSync(cwd, { recursive: true })
+      expect(() => ctx.subagents.getProvider('dsh-sdk')!.start!(resolved))
+        .toThrow(expectedFailure('stage: initialize; category: configuration'))
+      expect(createdHarnessOptions).toEqual([])
+      expect(warn).toHaveBeenCalledWith('subagent-dsh-sdk "dsh-sdk": child start failed: %o', expect.any(Error))
+    } finally {
+      warn.mockRestore()
+      await ctx.fiber.dispose()
+      rmSync(cwd, { recursive: true, force: true })
+    }
   })
 
   it('rejects after reaping when the child dies before the handshake', async () => {
     const rawStderr = 'scripted boot failure at /private/path SECRET_TOKEN'
     const ctx = await setup({ FAKE_EXIT_BEFORE_INIT: '1', FAKE_STDERR: rawStderr })
-    const failure = await ctx.subagents.start('dsh-sdk', request()).then(
+    const failure = await startExternalActivation(ctx, 'dsh-sdk', request()).then(
       () => { throw new Error('start unexpectedly succeeded') },
       (error: unknown) => error,
     )
@@ -700,7 +743,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     [{ FAKE_INIT_ERROR: '1' }, 'protocol'],
   ] as const)('rejects an initialize failure with safe %s facts', async (env, category) => {
     const ctx = await setup({ ...env })
-    await expect(ctx.subagents.start('dsh-sdk', request())).rejects.toThrow(
+    await expect(startExternalActivation(ctx, 'dsh-sdk', request())).rejects.toThrow(
       `subagent-dsh-sdk: ${expectedFailure(`stage: initialize; category: ${category}`)}`,
     )
     await ctx.fiber.dispose()
@@ -734,19 +777,17 @@ describe('dsh-subagent-dsh-sdk provider', () => {
       cwd: process.cwd(),
       provider: 'p',
       model: 'm',
-      // The fake dies as soon as the prompt arrives: FAKE_HANG_PROMPT plus a
-      // short-lived process is simulated by killing via dispose below instead;
-      // here use FAKE_MALFORMED to make the prompt reply violate the protocol.
       env: { FAKE_MALFORMED_PROMPT: '1' },
-      shutdownTimeoutMs: 100,
-      disposeEofGraceMs: 200,
-      disposeGraceMs: 200,
+      shutdownTimeoutMs: DEFAULT_SHUTDOWN_TIMEOUT_MS,
+      disposeEofGraceMs: DEFAULT_DISPOSE_EOF_GRACE_MS,
+      disposeGraceMs: DEFAULT_DISPOSE_GRACE_MS,
       onError: (error) => {
         seen.push(error.message)
         throw new Error('sink failure must be contained')
       },
     }
     const run = await startSdkRun(request(), spec)
+    onTestFinished(() => run.dispose())
     const result = await run.result
     expect(result.stopReason).toBe('error')
     expect(result.diagnostic).toBe(
@@ -760,7 +801,7 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     const ctx = await setup({ FAKE_MALFORMED_PROMPT: '1' })
     const warnings: string[] = []
     ctx.logger.warn = ((message: unknown) => { warnings.push(String(message)) }) as typeof ctx.logger.warn
-    const run = await ctx.subagents.start('dsh-sdk', request())
+    const run = await startExternalActivation(ctx, 'dsh-sdk', request())
     expect(await run.result).toMatchObject({
       stopReason: 'error',
       diagnostic: expectedFailure('stage: session-run; category: protocol'),
@@ -774,18 +815,18 @@ describe('dsh-subagent-dsh-sdk provider', () => {
   it('wraps a shutdown rejection with safe facts after the runtime is reaped', async () => {
     const rawCleanup = 'shutdown failed at /private/path SECRET_TOKEN'
     const ctx = await setup()
-    const run = await ctx.subagents.start('dsh-sdk', request())
-    await run.result
     const spy = vi.spyOn(DeepSeekHarness.prototype, 'close').mockImplementation(async function (this: DeepSeekHarness) {
       spy.mockRestore()
       await this.close()
       throw new Error(rawCleanup)
     })
     try {
+      const run = await startExternalActivation(ctx, 'dsh-sdk', request())
+      await run.result
       const error = await run.dispose().catch((cause: unknown) => cause)
       expect(error).toBeInstanceOf(Error)
       expect((error as Error).message).toBe(
-        `subagent-dsh-sdk: ${expectedFailure('stage: shutdown; category: unknown')}`,
+        `subagent "${run.childId}" activation handle disposal failed: subagent-dsh-sdk: ${expectedFailure('stage: shutdown; category: unknown')}`,
       )
       expect((error as Error).message).not.toContain(rawCleanup)
     } finally {
@@ -796,6 +837,8 @@ describe('dsh-subagent-dsh-sdk provider', () => {
 
   it('registers under the configured provider name and unregisters on fiber dispose (HMR safety)', async () => {
     const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
+    await mountWorkingDirectoryFixture(ctx)
     await ctx.plugin(SubagentRuntime)
     const fiber = await ctx.plugin(sdk, {
       providerName: 'sdk-hmr',
@@ -810,10 +853,9 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     expect(ctx.subagents.getProvider('sdk-hmr')?.inheritsParentContext).toBe(false)
     expect(ctx.subagents.getProvider('sdk-hmr')?.capabilities).toEqual({
       agentOptions: true,
+      agentPreset: false,
       outputSchema: false,
       depthLimit: false,
-      toolFilter: false,
-      persona: false,
     })
     await fiber.dispose()
     expect(ctx.subagents.getProvider('sdk-hmr')).toBeUndefined()
@@ -822,6 +864,8 @@ describe('dsh-subagent-dsh-sdk provider', () => {
 
   it('rejects non-positive timing bounds at load', async () => {
     const ctx = new Context()
+    await ctx.plugin(SessionProjectionRegistry)
+    await mountWorkingDirectoryFixture(ctx)
     await ctx.plugin(SubagentRuntime)
     const base = { providerName: 'sdk', profile: 'sdk', patches: [], dshHome: process.cwd(), provider: 'p', model: 'm', env: {} }
     await expect(ctx.plugin(sdk, { ...base, shutdownTimeoutMs: 0 })).rejects.toThrow('shutdownTimeoutMs must be a positive finite number')
@@ -832,6 +876,8 @@ describe('dsh-subagent-dsh-sdk provider', () => {
 
   it('requires an explicit absolute Harness home for nested dsh runtimes', async () => {
     const ctx = new Context()
+    await mountWorkingDirectoryFixture(ctx)
+    if (ctx.get('sessionProjections') === undefined) await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(SubagentRuntime)
     await expect(ctx.plugin(sdk, {
       providerName: 'sdk',
@@ -851,6 +897,8 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     { field: 'patches[0]', override: { patches: ['./missing-child-patch.yml'] } },
   ])('rejects an invalid $field at load', async ({ field, override }) => {
     const ctx = new Context()
+    await mountWorkingDirectoryFixture(ctx)
+    if (ctx.get('sessionProjections') === undefined) await ctx.plugin(SessionProjectionRegistry)
     await ctx.plugin(SubagentRuntime)
     await expect(ctx.plugin(sdk, {
       providerName: 'sdk',
@@ -869,6 +917,8 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     'rejects invalid maxTokens %s at load',
     async (maxTokens) => {
       const ctx = new Context()
+      await ctx.plugin(SessionProjectionRegistry)
+      await mountWorkingDirectoryFixture(ctx)
       await ctx.plugin(SubagentRuntime)
       await expect(ctx.plugin(sdk, {
         providerName: 'sdk',
@@ -888,6 +938,8 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     'defensively rejects invalid maxTokens %s when apply is called directly',
     async (maxTokens) => {
       const ctx = new Context()
+      await ctx.plugin(SessionProjectionRegistry)
+      await mountWorkingDirectoryFixture(ctx)
       await ctx.plugin(SubagentRuntime)
       expect(() => { sdk.apply(ctx, {
         providerName: 'sdk',
@@ -906,30 +958,15 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     },
   )
 
-  it('rejects an empty config cwd at load', async () => {
-    const ctx = new Context()
-    await ctx.plugin(SubagentRuntime)
-    await expect(ctx.plugin(sdk, {
-      providerName: 'sdk',
-      profile: 'sdk',
-      patches: [],
-      dshHome: process.cwd(),
-      cwd: '',
-      provider: 'p',
-      model: 'm',
-      env: {},
-    })).rejects.toThrow('config cwd must not be empty')
-    await ctx.fiber.dispose()
-  })
-
-  it('uses a validated config cwd override instead of the parent session cwd', async () => {
+  it('uses an explicit child directory while preserving the parent origin', async () => {
     const tmp = mkdtempSync(join(tmpdir(), 'subagent-dsh-sdk-cwd-'))
     try {
-      const ctx = await setup({ FAKE_ECHO_CWD: '1', FAKE_TEXT: 'done' }, { cwd: tmp })
-      const run = await ctx.subagents.start('dsh-sdk', request())
+      const ctx = await setup({ FAKE_ECHO_CWD: '1', FAKE_TEXT: 'done' })
+      const run = await startExternalActivation(ctx, 'dsh-sdk', { ...request(), cwd: tmp })
       const result = await run.result
       const { realpathSync } = await import('node:fs')
       expect(text(result.output)).toContain(`cwd=${realpathSync(tmp)}`)
+      expect(createdHarnessOptions.at(-1)?.cwd).toBe(process.cwd())
       await run.dispose()
       await ctx.fiber.dispose()
     } finally {
@@ -937,15 +974,12 @@ describe('dsh-subagent-dsh-sdk provider', () => {
     }
   })
 
-  it('fails loud when neither config cwd nor parent session cwd exists', async () => {
+  it('uses the runtime directory when the parent has no origin', async () => {
     const ctx = await setup()
     const parent = { id: 'parent', session: { header: {} } } as unknown as Agent
-    await expect(ctx.subagents.start('dsh-sdk', {
-      label: 'p', prompt: [{ type: 'text' as const, text: 'p' }], parent, signal: new AbortController().signal,
-    }))
-      .rejects.toThrow(
-        `subagent-dsh-sdk: ${expectedFailure('stage: initialize; category: configuration')}`,
-      )
+    const run = await startExternalActivation(ctx, 'dsh-sdk', { ...request(), parent })
+    expect((await run.result).stopReason).toBe('completed')
+    await run.dispose()
     await ctx.fiber.dispose()
   })
 

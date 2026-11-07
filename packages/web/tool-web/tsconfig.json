@@ -28,10 +28,10 @@
       "path": "../../guard/timeout-policy"
     },
     {
-      "path": "../web"
+      "path": "../../util/output-retention"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../web"
     }
   ]
 }

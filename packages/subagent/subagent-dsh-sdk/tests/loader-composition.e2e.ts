@@ -1,6 +1,6 @@
 /**
  * Keyless REAL-composition coverage for dynamic child routing and parent cwd
- * inheritance across the SDK wire. A test-only cordis.yml boots through the
+ * inheritance across the SDK wire. A test-only patch boots through the
  * Loader, a scripted model selects provider/model/reasoning, tool config adds
  * maxTokens, and a COMPLETE second harness runtime echoes the effective route
  * and cwd. The same path also verifies model-visible child-failure diagnostics
@@ -18,8 +18,8 @@ import { runLoaderSmoke } from '@deepseek-ai/dsh-loader-smoke'
 
 const fixtureDir = new URL('./fixtures/loader/', import.meta.url)
 const driver = fileURLToPath(new URL('driver.ts', fixtureDir))
-const configPath = fileURLToPath(new URL('cordis.yml', fixtureDir))
-const childConfigPath = fileURLToPath(new URL('child.cordis.yml', fixtureDir))
+const configPath = fileURLToPath(new URL('dsh-sdk.patch.yml', fixtureDir))
+const childConfigPath = fileURLToPath(new URL('child.patch.yml', fixtureDir))
 const childMockPath = fileURLToPath(new URL('child-mock-llm.ts', fixtureDir))
 const repoTsconfig = fileURLToPath(new URL('../../../../tsconfig.json', import.meta.url))
 
@@ -38,13 +38,18 @@ async function sessionEvents(log: string): Promise<SessionEvent[]> {
   return lines.slice(1).map(line => JSON.parse(line) as SessionEvent)
 }
 
-function toolResultText(events: SessionEvent[]): string {
+function settlementText(events: SessionEvent[]): string[] {
   const results = events.filter(event => event.type === 'tool/result')
   expect(results).toHaveLength(1)
-  return results[0]!.data.message.content[0].content
-    .filter(block => block.type === 'text')
-    .map(block => block.text)
-    .join('')
+  const notices = events.filter(event => event.type === 'user/message'
+    && event.data.source.kind === 'subagent-settled')
+  expect(notices).toHaveLength(1)
+  const notice = notices[0]!
+  if (notice.type !== 'user/message' || notice.data.source.kind !== 'subagent-settled') throw new Error('missing completion notice')
+  expect(results[0]!.data.message.content).toEqual([
+    { type: 'text', text: `started subagent ${notice.data.source.senderSessionId}` },
+  ])
+  return notice.data.content.slice(1).filter(block => block.type === 'text').map(block => block.text)
 }
 
 async function childLaunch(failure = false): Promise<{
@@ -52,7 +57,7 @@ async function childLaunch(failure = false): Promise<{
   env: Record<string, string>
 }> {
   const childHome = await mkdtemp(join(tmpdir(), 'dsh-sdk-subagent-home-'))
-  const childPatch = join(childHome, 'child.cordis.yml')
+  const childPatch = join(childHome, 'child.patch.yml')
   await writeFile(childPatch, (await readFile(childConfigPath, 'utf8'))
     .replace("'./child-mock-llm.ts'", JSON.stringify(pathToFileURL(childMockPath).href)))
   return {
@@ -65,7 +70,7 @@ async function childLaunch(failure = false): Promise<{
   }
 }
 
-describe('SDK subagent routing and diagnostics through a real cordis.yml', () => {
+describe('SDK subagent routing and diagnostics through the production profile', () => {
   it('runs the selected child route in the parent session workspace', async () => {
     const child = await childLaunch()
     let events: SessionEvent[] = []
@@ -109,16 +114,7 @@ describe('SDK subagent routing and diagnostics through a real cordis.yml', () =>
       })
       expect(stderr).not.toContain('UNHANDLED')
 
-      // The parent's tool result carries the child model's echo of its real
-      // process.cwd() — the parent session's workspace, never the harness
-      // process's launch directory.
-      const results = events.filter(event => event.type === 'tool/result')
-      expect(results).toHaveLength(1)
-      const resultText = results[0]!.data.message.content[0].content
-        .filter(block => block.type === 'text')
-        .map(block => block.text)
-        .join('')
-      expect(resultText).toBe(`child route: mock/mock-routed/max/777; cwd: ${workspace}`)
+      expect(settlementText(events)).toEqual(['Its closing message:', `child route: mock/mock-routed/max/777; cwd: ${workspace}`])
       expect(parentResolvedRoutes).toContain('mock/mock-routed')
 
       // The child ran a real turn with the model-selected route and tool-configured cap.
@@ -161,11 +157,11 @@ describe('SDK subagent routing and diagnostics through a real cordis.yml', () =>
         },
       })
       expect(stderr).not.toContain('UNHANDLED')
-      expect(toolResultText(events)).toBe(
-        'Error: subagent run failed\n'
-        + 'Diagnostic: Subagent failure (provider: DSH SDK; stage: session-run; category: child-error)\n'
-        + 'Partial output before the run ended:\npartial child loader answer',
-      )
+      expect(settlementText(events)).toEqual([
+        'Its closing message:',
+        'partial child loader answer',
+        'Subagent failure (provider: DSH SDK; stage: session-run; category: child-error)',
+      ])
     } finally {
       await rm(child.childHome, { recursive: true, force: true })
     }

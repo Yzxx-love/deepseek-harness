@@ -21,6 +21,10 @@ import type {
 
 /** A minimal in-memory fake implementing the provider primitives. */
 class FakeFileSystem extends FileSystem {
+  override async patchText(): Promise<never> { throw new FsError('patch unsupported by test provider', 'FS_IO_ERROR') }
+  override async deleteFile(): Promise<never> { throw new FsError('delete unsupported by test provider', 'FS_IO_ERROR') }
+  override async moveFile(): Promise<never> { throw new FsError('move unsupported by test provider', 'FS_IO_ERROR') }
+
   files = new Map<string, string>()
 
   override async resolve(path: string): Promise<FsTarget> {
@@ -56,6 +60,9 @@ class FakeFileSystem extends FileSystem {
       throw new FsError(`too large: ${target.displayPath}`, 'FS_TOO_LARGE')
     }
     return bytes
+  }
+  override async readByteRange(target: FsTarget, range: { offset: number; length: number }): Promise<Uint8Array> {
+    return new TextEncoder().encode(await this.readText(target)).subarray(range.offset, range.offset + range.length)
   }
   override async listDir(target: FsTarget): Promise<FsDirEntry[]> {
     if (target.targetKey !== 'skills') throw new FsError(`not a directory: ${target.displayPath}`, 'FS_NOT_DIRECTORY')
@@ -120,6 +127,17 @@ describe('FileSystem provider seam', () => {
     expect(streamed).toBe(await fs.readText(target))
   })
 
+  it('readByteRange returns the window, shorter at the end and empty past it', async () => {
+    const ctx = new Context()
+    await ctx.plugin(FakeFileSystem)
+    const fs = ctx.fs as FakeFileSystem
+    fs.files.set('a.bin', 'hello')
+    const target = await fs.resolve('a.bin')
+    expect(await fs.readByteRange(target, { offset: 1, length: 3 })).toEqual(new TextEncoder().encode('ell'))
+    expect(await fs.readByteRange(target, { offset: 3, length: 10 })).toEqual(new TextEncoder().encode('lo'))
+    expect(await fs.readByteRange(target, { offset: 9, length: 2 })).toHaveLength(0)
+  })
+
   it('readBytes returns raw content and enforces the byte cap with FS_TOO_LARGE', async () => {
     const ctx = new Context()
     await ctx.plugin(FakeFileSystem)
@@ -128,6 +146,14 @@ describe('FileSystem provider seam', () => {
     const target = await fs.resolve('a.bin')
     expect(await fs.readBytes(target, undefined, 2)).toEqual(new TextEncoder().encode('hi'))
     await expect(fs.readBytes(target, undefined, 1)).rejects.toMatchObject({ code: 'FS_TOO_LARGE' })
+  })
+
+  it('rejects watching when a provider does not implement observation', async () => {
+    const ctx = new Context()
+    await ctx.plugin(FakeFileSystem)
+    const fs = ctx.fs as FakeFileSystem
+    await expect(fs.watch(await fs.resolve('a.txt'), () => {}, new AbortController().signal))
+      .rejects.toMatchObject({ code: 'FS_IO_ERROR' })
   })
 
   it('listDir returns child entry targets without reading file content', async () => {
@@ -182,4 +208,17 @@ describe('FsError', () => {
     expect(error.cause).toBe(root)
     expect(error.code).toBe('FS_ABORTED')
   })
+})
+
+it('exposes guarded patch, delete, and move on the provider interface', async () => {
+  const ctx = new Context()
+  const fiber = await ctx.plugin(FakeFileSystem)
+  try {
+    const target = await ctx.fs.resolve('a')
+    await expect(ctx.fs.patchText(target, [])).rejects.toMatchObject({ code: 'FS_IO_ERROR' })
+    await expect(ctx.fs.deleteFile(target)).rejects.toMatchObject({ code: 'FS_IO_ERROR' })
+    await expect(ctx.fs.moveFile(target, target, {})).rejects.toMatchObject({ code: 'FS_IO_ERROR' })
+    expect(new FsError('mismatch', 'FS_PATCH_MISMATCH').code).toBe('FS_PATCH_MISMATCH')
+    expect(new FsError('same target', 'FS_SAME_TARGET').code).toBe('FS_SAME_TARGET')
+  } finally { await fiber.dispose() }
 })

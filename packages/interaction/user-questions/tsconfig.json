@@ -21,7 +21,22 @@
       "path": "../../llm/llm"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../../typert/protocol"
+    },
+    {
+      "path": "../../core/scope"
+    },
+    {
+      "path": "../../core/session"
+    },
+    {
+      "path": "../../session/session-projection"
+    },
+    {
+      "path": "../../../vendor/schemastery"
+    },
+    {
+      "path": "../../core/tool-executor-ptc"
     }
   ]
 }

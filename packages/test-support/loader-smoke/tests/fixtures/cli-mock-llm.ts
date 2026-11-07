@@ -7,11 +7,16 @@ import {
   type LlmResolvedModelInfo,
   type StreamChunk,
 } from '@deepseek-ai/dsh-llm'
+import type {} from '@deepseek-ai/dsh-tools'
 
 const HIGH = ReasoningEffortId('high')
 const OFF = ReasoningEffortId('off')
+const SHELL_TOOL = process.platform === 'win32' ? 'pwsh' : 'bash'
+const SHELL_COMMAND = process.platform === 'win32'
+  ? "Write-Output 'CLI_TOOL_ROUND_TRIP'"
+  : 'printf CLI_TOOL_ROUND_TRIP'
 
-/** Keyless headless-agent adapter: one real bash call followed by a final answer. */
+/** Keyless headless-agent adapter: one production shell call followed by a final answer. */
 class CliMockAdapter extends LlmAdapter {
   override async resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     return {
@@ -33,16 +38,17 @@ class CliMockAdapter extends LlmAdapter {
       yield { type: 'finish', reason: { kind: 'error', failure: { code: 'SERVER', message: 'CLI mock provider failed' } } }
       return
     }
-    const toolResult = options.messages.at(-1)?.content.find(block => block.type === 'tool-result')
+    const last = options.messages.at(-1)
+    const toolResult = last?.role === 'tool' ? last : undefined
     if (toolResult === undefined) {
       const reasoning = 'Inspecting the task before the tool call.'
-      const args = JSON.stringify({ command: 'printf CLI_TOOL_ROUND_TRIP', description: 'Prove the CLI tool round trip.' })
+      const args = JSON.stringify({ command: SHELL_COMMAND, description: 'Prove the CLI tool round trip.' })
       yield { type: 'block-start', index: 0, blockType: 'reasoning' }
       yield { type: 'reasoning-delta', index: 0, text: reasoning }
       yield { type: 'block-end', index: 0, block: { type: 'reasoning', text: reasoning } }
       yield { type: 'block-start', index: 1, blockType: 'tool-call' }
-      yield { type: 'tool-call-delta', index: 1, id: ToolCallId('cli-smoke-call'), name: 'bash', argumentsDelta: args }
-      yield { type: 'block-end', index: 1, block: { type: 'tool-call', id: ToolCallId('cli-smoke-call'), name: 'bash', arguments: args } }
+      yield { type: 'tool-call-delta', index: 1, id: ToolCallId('cli-smoke-call'), name: SHELL_TOOL, argumentsDelta: args }
+      yield { type: 'block-end', index: 1, block: { type: 'tool-call', id: ToolCallId('cli-smoke-call'), name: SHELL_TOOL, arguments: args } }
       yield { type: 'usage', usage: { inputTokens: 11, outputTokens: 3, cacheReadTokens: 2 } }
       yield { type: 'finish', reason: { kind: 'tool-calls' } }
       return
@@ -62,13 +68,17 @@ class CliMockAdapter extends LlmAdapter {
 }
 
 export const name = 'cli-mock-llm'
-export const inject = ['llm']
+export const inject = ['llm', 'tools']
 
-/** Register the keyless `cli-mock` adapter. */
+/** Register the keyless `cli-mock` adapter and select `off` effort for the step after a tool call. */
 export function apply(ctx: Context): void {
   ctx.llm.registerAdapter(['cli-mock'], new CliMockAdapter())
-  ctx.on('agent/request', async ({ step }, next) => {
-    const config = await next()
-    return step === 2 ? { ...config, reasoningEffort: OFF } : config
+  ctx.on('tools/execute', async (exec, next) => {
+    const result = await next()
+    const current = exec.agent === undefined ? undefined : exec.agent.model.current()
+    if (exec.agent !== undefined && current !== undefined) {
+      exec.agent.model.select({ provider: current.provider, model: current.model, reasoningEffort: OFF })
+    }
+    return result
   })
 }

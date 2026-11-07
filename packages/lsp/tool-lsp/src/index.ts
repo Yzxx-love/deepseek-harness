@@ -10,14 +10,14 @@
  * @module @deepseek-ai/dsh-tool-lsp
  */
 
+import type {} from '@deepseek-ai/dsh-working-directory'
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import { assertNever } from '@deepseek-ai/dsh-llm'
 import { LspError } from '@deepseek-ai/dsh-lsp'
 import type {} from '@deepseek-ai/dsh-lsp'
-import { FIRST_PARTY_SECTION_ORDER } from '@deepseek-ai/dsh-system-prompt'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
+import { assertNever } from '@deepseek-ai/dsh-util-values'
 import {
   DEFAULT_MAX_LOCATIONS,
   DEFAULT_MAX_RESULT_CHARS,
@@ -27,7 +27,6 @@ import {
   parseLspArgs,
   presentLspCall,
 } from './render.ts'
-import { sessionCwd } from './session-cwd.ts'
 
 export {
   DEFAULT_MAX_LOCATIONS,
@@ -39,13 +38,12 @@ export {
   presentLspCall,
   renderUri,
 } from './render.ts'
-export { sessionCwd } from './session-cwd.ts'
 
 /** Cordis plugin name for loader diagnostics. */
 export const name = 'tool-lsp'
 
 /** Services required by this plugin. */
-export const inject = ['tools', 'lsp', 'systemPrompt']
+export const inject = ['tools', 'lsp', 'systemPrompt', 'workingDirectory']
 
 /** Default tool-call timeout budget (ms), covering the queued open/query/close lifecycle. */
 export const DEFAULT_LSP_TOOL_TIMEOUT_MS = 60_000
@@ -103,7 +101,7 @@ export function apply(ctx: Context, config: Config): void {
 
   ctx.systemPrompt.section({
     name: 'tool:lsp',
-    order: FIRST_PARTY_SECTION_ORDER.TOOL_LSP,
+    order: ctx.systemPrompt.getSectionOrder('TOOL_LSP'),
     text: LSP_PROMPT_TEXT,
   })
 
@@ -183,7 +181,7 @@ export function apply(ctx: Context, config: Config): void {
     timeoutMs: resolved.timeoutMs,
     async execute(args, exec) {
       const input = parseLspArgs(args)
-      const workspaceRoot = sessionCwd(exec)
+      const workspaceRoot = exec.agent === undefined ? undefined : await ctx.workingDirectory.ensure(exec.agent, exec.signal)
       if (workspaceRoot === undefined) {
         throw new LspError('the lsp tool requires a session workspace cwd', 'LSP_WORKSPACE_REQUIRED')
       }

@@ -21,7 +21,10 @@
       "path": "../../core/tools"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../tool-executor-native"
+    },
+    {
+      "path": "../tool-executor-ptc"
     }
   ]
 }

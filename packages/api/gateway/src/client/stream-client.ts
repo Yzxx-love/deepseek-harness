@@ -1,4 +1,6 @@
-/** Browser owner for the Gateway multiplexed Remote stream socket. */
+/** Client owner for the Gateway multiplexed Remote stream socket. */
+import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
+import type { ConnectionWebSocket } from '@deepseek-ai/dsh-client-connection/client'
 
 import {
   parseRemoteStreamServerMessage,
@@ -6,32 +8,8 @@ import {
   type RemoteStreamClientMessage,
   type RemoteStreamServerMessage,
 } from '../stream-protocol.ts'
+import { Deque } from '@deepseek-ai/dsh-deque'
 import { randomUUID } from '@deepseek-ai/dsh-util-crypto'
-
-const INTERNAL_BASE = 'http://dsh.internal'
-const RECONNECT_BASE_MS = 500
-const RECONNECT_FACTOR = 2
-const RECONNECT_MAX_MS = 10_000
-
-/** One Host-reported Remote stream failure. */
-export class RemoteStreamError extends Error {
-  /** Stable carrier or Gateway error category. */
-  readonly code: string
-  /** Host-provided structured failure context. */
-  readonly details: object
-
-  /**
-   * @param code - stable Gateway or business error category.
-   * @param message - Host-provided failure description.
-   * @param details - Host-provided structured failure context.
-   */
-  constructor(code: string, message: string, details: object) {
-    super(message)
-    this.name = 'RemoteStreamError'
-    this.code = code
-    this.details = details
-  }
-}
 
 /** Physical Remote stream socket failure that may be retried by a domain transport. */
 export class RemoteStreamCarrierError extends Error {
@@ -46,45 +24,103 @@ export class RemoteStreamCarrierError extends Error {
 }
 
 interface SocketWaiter {
-  resolve(socket: WebSocket): void
+  readonly revision: number
+  resolve(socket: ConnectionWebSocket): void
   reject(error: unknown): void
 }
 
-/** Keep one physical WebSocket and share it among independently cancellable Remote streams. */
+interface UplinkPump {
+  /** Settles once the pump has stopped sending. */
+  readonly done: Promise<void>
+  /** Interrupt the pump, including a read blocked on the caller's iterator, and release the iterator. */
+  stop(): void
+}
+
+/** One open logical stream: its downlink frames and, once the `open` frame is out, its uplink pump. */
+interface LogicalStream {
+  readonly inbox: StreamInbox
+  pump: UplinkPump | undefined
+}
+
+const UPLINK_DONE: IteratorReturnResult<undefined> = { value: undefined, done: true }
+
+/**
+ * Keep one physical WebSocket and share it among independently cancellable
+ * Remote streams. A carrier that supplies an in-process stream opener never
+ * starts one.
+ */
 export class RemoteStreamMuxClient {
-  private socket: WebSocket | undefined
+  private socket: ConnectionWebSocket | undefined
   private cancelCandidate: ((error: Error) => void) | undefined
   private keepAlive: Promise<void> | undefined
-  private keepAliveAbort: AbortController | undefined
-  private readonly streams = new Map<string, StreamInbox>()
+  private revision = 0
+  private readonly streams = new Map<string, LogicalStream>()
   private readonly waiters = new Set<SocketWaiter>()
+  private readonly socketClosures = new Set<Promise<void>>()
   private running = false
   private disposed = false
+  private failure: RemoteStreamCarrierError | undefined
 
-  /** Start the persistent physical connection; repeated calls are inert. */
+  /**
+   * @param openSocket - selected authenticated carrier; omission uses the browser socket.
+   * @param waitForReconnect - answering Clients wait for Connection to replace a lost socket; passive Clients fail later opens immediately.
+   */
+  constructor(
+    private readonly openSocket: (path: string) => ConnectionWebSocket = () => new WebSocket(remoteStreamUrl()),
+    private readonly waitForReconnect = false,
+  ) {}
+
+  /** Ensure a physical attempt exists, following the current attempt once if needed. */
   start(): void {
-    if (this.running || this.disposed) return
+    if (this.disposed) return
     this.running = true
-    this.maintain()
+    if (this.socket?.readyState === 1) return
+    const pending = this.keepAlive
+    if (pending === undefined) this.maintain()
+    else void pending.then(() => { this.maintain() })
+  }
+
+  /** Cancel the current socket or retry wait and start a fresh attempt immediately. */
+  reconnect(): void {
+    if (!this.running || this.disposed) return
+    const failure = new RemoteStreamCarrierError('api gateway: Remote stream reconnect requested')
+    const pending = this.keepAlive
+    this.revision++
+    this.failure = undefined
+    this.cancelCandidate?.(failure)
+    const socket = this.socket
+    if (socket !== undefined) {
+      this.socket = undefined
+      this.failAll(failure)
+      socket.close(4000, 'reconnect requested')
+    }
+    if (pending === undefined) this.maintain()
+    else void pending.then(() => { this.maintain() })
   }
 
   /**
    * Open one logical stream on the persistent physical connection.
+   * After an established socket is lost, answering Clients wait for Connection
+   * to reconnect or for their signal to abort; passive Clients reject immediately.
+   * An initial socket failure rejects both modes.
    * @param endpoint - Typert Remote stream endpoint.
    * @param payload - endpoint request encoded on the wire.
    * @param signal - cancellation for this logical stream.
+   * @param uplink - the Client's items: each is sent as an `item` frame, its end as `end`; its `return()`
+   * runs when the stream finishes, and its failure cancels the stream and fails the downlink.
    * @returns Host items until completion, cancellation, or failure.
    */
   async *open(
     endpoint: string,
     payload: unknown,
     signal: AbortSignal,
+    uplink?: AsyncIterable<unknown>,
   ): AsyncGenerator {
-    this.start()
     signal.throwIfAborted()
     const streamId = randomUUID()
     const inbox = new StreamInbox()
-    let carrier: WebSocket | undefined
+    const stream: LogicalStream = { inbox, pump: undefined }
+    let carrier: ConnectionWebSocket | undefined
     let opened = false
     let terminal = false
     const abort = (): void => { inbox.fail(signal.reason) }
@@ -93,9 +129,10 @@ export class RemoteStreamMuxClient {
       const socket = await this.waitForSocket(signal)
       signal.throwIfAborted()
       carrier = socket
-      this.streams.set(streamId, inbox)
+      this.streams.set(streamId, stream)
       this.send(socket, { type: 'open', streamId, endpoint, payload })
       opened = true
+      if (uplink !== undefined) stream.pump = this.pumpUplink(socket, streamId, uplink, signal, inbox)
       while (true) {
         const frame = await inbox.next()
         signal.throwIfAborted()
@@ -105,30 +142,91 @@ export class RemoteStreamMuxClient {
         }
         terminal = true
         if (frame.type === 'error') {
-          throw new RemoteStreamError(frame.error.code, frame.error.message, frame.error.details)
+          throw new RemoteError(frame.error.code as never, frame.error.message, frame.error.details as never)
         }
         return
       }
     } finally {
       signal.removeEventListener('abort', abort)
       this.streams.delete(streamId)
-      if (opened && !terminal && carrier?.readyState === WebSocket.OPEN) {
+      stream.pump?.stop()
+      if (opened && !terminal && carrier?.readyState === 1) {
         this.send(carrier, { type: 'cancel', streamId })
       }
+      // The old generation's pump has stopped before a supervisor reopens the next one.
+      if (stream.pump !== undefined) await stream.pump.done
     }
   }
 
   /**
-   * Permanently stop reconnecting, close the physical socket, and fail every active logical stream.
-   * @returns once the background connection loop has stopped.
+   * Send the caller's uplink items on this generation's socket. `stop()`
+   * interrupts a pump blocked on `uplink.next()` and releases the iterator: a
+   * handle's queue closes at once, so `send()` throws from then on, and any
+   * other iterator's `return()` is invoked without being awaited because a
+   * generator blocked in `next()` only completes it once it yields.
+   */
+  private pumpUplink(
+    socket: ConnectionWebSocket,
+    streamId: string,
+    uplink: AsyncIterable<unknown>,
+    signal: AbortSignal,
+    inbox: StreamInbox,
+  ): UplinkPump {
+    let stopped: PromiseWithResolvers<IteratorReturnResult<undefined>> | undefined
+    const interruption: IteratorReturnResult<undefined> = { value: undefined, done: true }
+    const uplinkIterator = uplink[Symbol.asyncIterator]()
+    const state = { stopping: false, exhausted: false, released: false }
+    const release = (): void => {
+      if (state.released || state.exhausted) return
+      state.released = true
+      if (uplink instanceof ClientUplinkQueue) uplink.close()
+      void Promise.resolve().then(() => uplinkIterator.return?.()).catch(() => undefined)
+    }
+    const done = (async (): Promise<void> => {
+      try {
+        while (true) {
+          const stoppingBeforeRead = state.stopping
+          if (stoppingBeforeRead) return
+          // A stop promise belongs to one read, not the whole uplink history.
+          stopped = Promise.withResolvers<IteratorReturnResult<undefined>>()
+          const next = await Promise.race([uplinkIterator.next(), stopped.promise])
+          stopped = undefined
+          if (state.stopping || next === interruption || signal.aborted || this.socket !== socket) return
+          if (next.done === true) {
+            state.exhausted = true
+            break
+          }
+          this.send(socket, { type: 'item', streamId, value: next.value })
+        }
+        this.send(socket, { type: 'end', streamId })
+      } catch (error) {
+        inbox.fail(error)
+      } finally {
+        stopped = undefined
+        release()
+      }
+    })()
+    return {
+      done,
+      stop: () => {
+        if (state.stopping) return
+        state.stopping = true
+        stopped?.resolve(interruption)
+        release()
+      },
+    }
+  }
+
+  /**
+   * Permanently stop the carrier, close the physical socket, and fail every
+   * active logical stream.
+   * @returns once the connection attempt and every physical socket have closed.
    */
   async close(): Promise<void> {
     if (!this.disposed) {
       this.disposed = true
       this.running = false
       const error = new Error('api gateway: Remote stream client disposed')
-      this.keepAliveAbort?.abort(error)
-      this.keepAliveAbort = undefined
       this.failAll(error)
       for (const waiter of [...this.waiters]) waiter.reject(error)
       this.cancelCandidate?.(error)
@@ -137,20 +235,24 @@ export class RemoteStreamMuxClient {
       socket?.close(1000, 'disposed')
     }
     await this.keepAlive
+    await Promise.all(this.socketClosures)
   }
 
-  private connect(): Promise<WebSocket> {
-    const socket = new WebSocket(remoteStreamUrl())
-    const connecting = new Promise<WebSocket>((resolve, reject) => {
+  private async connect(): Promise<ConnectionWebSocket> {
+    const socket = this.openSocket(REMOTE_STREAM_MUX_PATH)
+    const closed = new Promise<void>((resolve) => { socket.addEventListener('close', () => { resolve() }, { once: true }) })
+    this.socketClosures.add(closed)
+    void closed.then(() => { this.socketClosures.delete(closed) })
+    const connecting = new Promise<ConnectionWebSocket>((resolve, reject) => {
       let settled = false
       const rejectCandidate = (error: Error): void => {
         settled = true
         socket.removeEventListener('open', opened)
-        socket.removeEventListener('error', failed)
         socket.removeEventListener('message', received)
-        socket.removeEventListener('close', closed)
         this.cancelCandidate = undefined
-        socket.close()
+        // Node ws emits error when a connecting socket is closed. Keep its
+        // error listener until close even after rejecting the attempt.
+        if (socket.readyState < 2) socket.close()
         reject(error)
       }
       const opened = (): void => {
@@ -169,9 +271,12 @@ export class RemoteStreamMuxClient {
         }
         const error = new RemoteStreamCarrierError('api gateway: Remote stream WebSocket failed')
         this.lost(socket, error)
-        socket.close()
+        if (socket.readyState < 2) socket.close()
       }
       const closed = (): void => {
+        socket.removeEventListener('open', opened)
+        socket.removeEventListener('error', failed)
+        socket.removeEventListener('message', received)
         if (!settled) {
           rejectCandidate(new RemoteStreamCarrierError(
             'api gateway: Remote stream WebSocket closed before opening',
@@ -180,21 +285,22 @@ export class RemoteStreamMuxClient {
         }
         this.lost(socket)
       }
-      const received = (event: MessageEvent): void => { this.receive(socket, event.data) }
+      const received = (event: { readonly data: unknown }): void => { this.receive(socket, event.data) }
       this.cancelCandidate = rejectCandidate
       socket.addEventListener('open', opened, { once: true })
-      socket.addEventListener('error', failed, { once: true })
+      socket.addEventListener('error', failed)
       socket.addEventListener('message', received)
       socket.addEventListener('close', closed, { once: true })
     })
     return connecting
   }
 
-  private waitForSocket(signal: AbortSignal): Promise<WebSocket> {
+  private waitForSocket(signal: AbortSignal): Promise<ConnectionWebSocket> {
     signal.throwIfAborted()
-    if (this.socket?.readyState === WebSocket.OPEN) return Promise.resolve(this.socket)
+    if (this.socket?.readyState === 1) return Promise.resolve(this.socket)
     if (this.disposed) return Promise.reject(new Error('api gateway: Remote stream client disposed'))
-    this.start()
+    if (!this.running) return Promise.reject(new Error('api gateway: Remote stream client not started'))
+    if (this.failure !== undefined) return Promise.reject(this.failure)
     return new Promise((resolve, reject) => {
       const aborted = (): void => { waiter.reject(signal.reason) }
       const cleanup = (): void => {
@@ -202,6 +308,7 @@ export class RemoteStreamMuxClient {
         signal.removeEventListener('abort', aborted)
       }
       const waiter: SocketWaiter = {
+        revision: this.revision,
         resolve: (socket) => {
           cleanup()
           resolve(socket)
@@ -218,12 +325,16 @@ export class RemoteStreamMuxClient {
     })
   }
 
-  private receive(socket: WebSocket, data: unknown): void {
+  private receive(socket: ConnectionWebSocket, data: unknown): void {
     if (socket !== this.socket) return
     try {
       if (typeof data !== 'string') throw new Error('api gateway: Remote stream WebSocket requires text messages')
       const frame = parseRemoteStreamServerMessage(data)
-      this.streams.get(frame.streamId)?.push(frame)
+      const stream = this.streams.get(frame.streamId)
+      if (stream === undefined) return
+      stream.inbox.push(frame)
+      // A terminal frame ends the uplink now, not on the consumer's next read.
+      if (frame.type !== 'item') stream.pump?.stop()
     } catch (error) {
       const failure = new RemoteStreamCarrierError('api gateway: invalid Remote stream frame', { cause: error })
       this.failAll(failure)
@@ -233,91 +344,63 @@ export class RemoteStreamMuxClient {
   }
 
   private lost(
-    socket: WebSocket,
+    socket: ConnectionWebSocket,
     error: RemoteStreamCarrierError = new RemoteStreamCarrierError(
       'api gateway: Remote stream WebSocket closed',
     ),
   ): void {
     if (this.socket !== socket) return
     this.socket = undefined
+    if (!this.waitForReconnect) this.failure = error
     this.failAll(error)
-    this.maintain(error)
+    if (!this.waitForReconnect) {
+      for (const waiter of [...this.waiters]) waiter.reject(error)
+    }
   }
 
-  private maintain(previousFailure?: Error): void {
-    if (!this.running) return
-    if (this.keepAlive !== undefined) {
-      void this.keepAlive.then(() => { this.maintain(previousFailure) })
-      return
-    }
-    const abort = new AbortController()
-    this.keepAliveAbort = abort
-    const task = this.reconnect(abort.signal, previousFailure)
+  private maintain(): void {
+    if (!this.running || this.disposed) return
+    if (this.socket?.readyState === 1 || this.keepAlive !== undefined) return
+    const revision = this.revision
+    this.failure = undefined
+    const task = this.connect().then(
+      () => undefined,
+      (error: unknown) => {
+        if (!this.running) return
+        const failure = error instanceof RemoteStreamCarrierError ? error
+          : new RemoteStreamCarrierError('api gateway: Remote stream WebSocket failed to open', { cause: error })
+        if (this.revision === revision) this.failure = failure
+        for (const waiter of [...this.waiters]) {
+          if (waiter.revision <= revision) waiter.reject(failure)
+        }
+      },
+    )
     this.keepAlive = task
     void task.then(() => {
       this.keepAlive = undefined
-      this.keepAliveAbort = undefined
     })
   }
 
-  private async reconnect(signal: AbortSignal, previousFailure?: Error): Promise<void> {
-    let attempt = 0
-    let failure = previousFailure
-    while (this.isRunning(signal) && this.socket?.readyState !== WebSocket.OPEN) {
-      if (failure !== undefined) {
-        attempt += 1
-        console.warn(`[api-gateway] Remote stream connection unavailable, retry #${String(attempt)}`, failure)
-        await sleep(backoffDelay(attempt), signal)
-        if (!this.isRunning(signal)) return
-      }
-      try {
-        await this.connect()
-        return
-      } catch (error) {
-        if (!this.isRunning(signal)) return
-        failure = error as Error
-      }
+  private failAll(error: unknown): void {
+    for (const stream of this.streams.values()) {
+      stream.inbox.fail(error)
+      stream.pump?.stop()
     }
   }
 
-  private isRunning(signal: AbortSignal): boolean {
-    return this.running && !signal.aborted
-  }
-
-  private failAll(error: unknown): void {
-    for (const stream of this.streams.values()) stream.fail(error)
-  }
-
-  private send(socket: WebSocket, message: RemoteStreamClientMessage): void {
+  private send(socket: ConnectionWebSocket, message: RemoteStreamClientMessage): void {
     socket.send(JSON.stringify(message))
   }
 }
 
-function backoffDelay(attempt: number): number {
-  const cap = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * RECONNECT_FACTOR ** Math.max(0, attempt - 1))
-  return cap / 2 + Math.random() * (cap / 2)
-}
-
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(done, ms)
-    signal.addEventListener('abort', done, { once: true })
-    function done(): void {
-      clearTimeout(timer)
-      signal.removeEventListener('abort', done)
-      resolve()
-    }
-  })
-}
-
 class StreamInbox {
-  private readonly frames: RemoteStreamServerMessage[] = []
+  private readonly frames = new Deque<RemoteStreamServerMessage>()
   private wake: (() => void) | undefined
   private failure: Error | undefined
 
   push(frame: RemoteStreamServerMessage): void {
     if (this.failure !== undefined) return
-    this.frames.push(frame)
+    this.frames.pushBack(frame)
     this.wake?.()
     this.wake = undefined
   }
@@ -325,24 +408,103 @@ class StreamInbox {
   fail(error: unknown): void {
     if (this.failure !== undefined) return
     this.failure = error instanceof Error ? error : new Error(String(error), { cause: error })
-    this.frames.length = 0
+    this.frames.clear()
     this.wake?.()
     this.wake = undefined
   }
 
   async next(): Promise<RemoteStreamServerMessage> {
-    while (this.frames.length === 0) {
+    while (this.frames.size === 0) {
       if (this.failure !== undefined) throw this.failure
       await new Promise<void>((resolve) => { this.wake = resolve })
     }
-    return this.frames.shift() as RemoteStreamServerMessage
+    return this.frames.popFront() as RemoteStreamServerMessage
+  }
+}
+
+/**
+ * Uplink items a stream handle queues for its carrier: the mux pump or the
+ * in-process Host decoder iterates it as the stream's uplink. `end()` is the
+ * Client half-close; `close()` marks the stream terminated, after which
+ * `push()` throws. One consumer reads it, one read at a time.
+ */
+export class ClientUplinkQueue implements AsyncIterable<unknown>, AsyncIterator<unknown> {
+  private readonly items = new Deque<unknown>()
+  private ended = false
+  private closed = false
+  private wake: (() => void) | undefined
+
+  /** @param endpoint - canonical Remote endpoint named by failures. */
+  constructor(private readonly endpoint: string) {}
+
+  /**
+   * Queue one item for the carrier.
+   * @param item - item the Host validates against the method's uplink codec.
+   * @throws {Error} after `end()` or once the stream has terminated.
+   */
+  push(item: unknown): void {
+    if (this.closed) throw new Error(`client api: ${this.endpoint} stream has terminated`)
+    if (this.ended) throw new Error(`client api: ${this.endpoint} uplink was ended`)
+    this.items.pushBack(item)
+    this.signal()
+  }
+
+  /** Half-close: the carrier reads the queued items, then `end`. Idempotent; ignored after termination. */
+  end(): void {
+    if (this.ended || this.closed) return
+    this.ended = true
+    this.signal()
+  }
+
+  /** The carrier stopped reading: the logical stream terminated or was disposed. Idempotent. */
+  close(): void {
+    if (this.closed) return
+    this.closed = true
+    this.items.clear()
+    this.signal()
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<unknown> {
+    return this
+  }
+
+  /**
+   * Take the next queued item, waiting for one; ends after `end()` or `close()`.
+   * @returns the next item, or the end of the uplink.
+   * @throws {Error} when a read is already pending.
+   */
+  async next(): Promise<IteratorResult<unknown>> {
+    while (true) {
+      if (this.closed) return UPLINK_DONE
+      if (this.items.size > 0) return { value: this.items.popFront(), done: false }
+      if (this.ended) return UPLINK_DONE
+      if (this.wake !== undefined) throw new Error(`client api: ${this.endpoint} uplink has one pending read`)
+      await new Promise<void>((resolve) => { this.wake = resolve })
+    }
+  }
+
+  /**
+   * The carrier is done with the uplink: close it.
+   * @returns the end of the uplink.
+   */
+  return(): Promise<IteratorResult<unknown>> {
+    this.close()
+    return Promise.resolve(UPLINK_DONE)
+  }
+
+  private signal(): void {
+    const wake = this.wake
+    this.wake = undefined
+    wake?.()
   }
 }
 
 function remoteStreamUrl(): string {
-  const location = (globalThis as { location?: { origin?: string } }).location
-  const base = location?.origin !== undefined && location.origin !== 'null' ? location.origin : INTERNAL_BASE
-  const url = new URL(REMOTE_STREAM_MUX_PATH, base)
+  // The mux route is registered absolute; a page resolves its document-relative
+  // form against its own document base. A shell-owned Host on another origin
+  // supplies that base through the transport.
+  const globals = globalThis as { __DSH_TRANSPORT__?: { streamBaseUrl?: string } }
+  const url = new URL(REMOTE_STREAM_MUX_PATH.slice(1), globals.__DSH_TRANSPORT__?.streamBaseUrl ?? document.baseURI)
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
   return url.href
 }

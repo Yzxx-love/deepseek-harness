@@ -42,7 +42,9 @@ describe('web e2e: startup auto-selection', () => {
     onTestFailed(() => saveFailureShot(page, 'web-e2e-first-workspace-stable-tree'))
     await page.locator(`${ROOT_PHASE}[data-phase="hero"]`).waitFor({ timeout: 15_000 })
     const headline = page.getByText('Into the Unknown', { exact: true })
-    const fishHitbox = headline.locator('xpath=preceding-sibling::span[1]')
+    // The headline text sits in its own span inside the title group; the fish
+    // hitbox precedes the group, not the text span.
+    const fishHitbox = headline.locator('xpath=../preceding-sibling::span[1]')
     const fish = fishHitbox.locator('svg')
     expect(await fish.evaluate(node => getComputedStyle(node).color))
       .toBe(await headline.evaluate(node => getComputedStyle(node).color))
@@ -59,10 +61,36 @@ describe('web e2e: startup auto-selection', () => {
       if (Object.values(refs).some(node => node === null)) throw new Error('incomplete initial Hero tree')
       ;(window as unknown as { __heroTree: typeof refs }).__heroTree = refs
     })
+    // The input card's distance from the conversation top, once it holds for three frames.
+    const heroCardOffset = (): Promise<number> => page.evaluate(async () => {
+      const read = (): number => {
+        const root = document.querySelector('div[data-phase="hero"]')
+        const card = document.querySelector('[data-composer-card]')
+        if (root === null || card === null) throw new Error('incomplete Hero composer')
+        return card.getBoundingClientRect().top - root.getBoundingClientRect().top
+      }
+      const deadline = performance.now() + 5_000
+      let previous = read()
+      let stableFrames = 0
+      while (performance.now() < deadline) {
+        await new Promise<void>((resolve) => { requestAnimationFrame(() => { resolve() }) })
+        const current = read()
+        stableFrames = Math.abs(current - previous) < 0.01 ? stableFrames + 1 : 0
+        if (stableFrames >= 3) return current
+        previous = current
+      }
+      throw new Error('Hero input card did not settle')
+    })
+    const sessionlessOffset = await heroCardOffset()
 
     // A registered Workspace is the precondition for the reload case below;
     // this first connection is also the no-Workspace → Workspace path.
     await connectFreshWorkspace(page, scaffold.workspaceCwd, 'startup-auto-selection')
+    await page.locator('[data-slot="conversation.session.header"]').waitFor({ timeout: 15_000 })
+    // Binding the Workspace keeps the input card at the same height in the Hero.
+    // This holds for the default plugin set: `conversation.hero.options` entries
+    // render only with a Session and can change the Hero's height.
+    expect(Math.abs(await heroCardOffset() - sessionlessOffset)).toBeLessThanOrEqual(0.5)
 
     expect(await page.evaluate(() => {
       const before = (window as unknown as { __heroTree: Record<string, Element> }).__heroTree
@@ -130,7 +158,7 @@ describe('web e2e: startup auto-selection', () => {
       expect(await page.locator('[data-composer-input]').first().isVisible()).toBe(true)
 
       releaseOpening()
-      await page.locator('[data-composer-input][contenteditable="true"][data-placeholder="Describe what you want to build... / commands, @ files or sessions"]')
+      await page.locator('[data-composer-input][contenteditable="true"][data-placeholder="Describe what you want to build, / commands, @ files or sessions"]')
         .waitFor({ timeout: 15_000 })
       acknowledgeReloadConnectionLoss(tripwire, warningsBefore)
 

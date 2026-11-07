@@ -1,14 +1,28 @@
 /**
- * Verify client package modes, npm dependency sections, and the synchronous
- * browser module-request graph.
+ * Verify client package modes, the synchronous browser module-request graph, and package-asset publication.
  */
 
 import { globSync, readFileSync, writeFileSync } from 'node:fs'
-import { dirname, resolve, sep } from 'node:path'
+import { dirname, posix, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
+import { transform } from 'lightningcss'
 import ts from 'typescript'
+import {
+  PACKAGE_ASSET_EXPORT,
+  PACKAGE_ASSET_EXPORT_TARGET,
+  PACKAGE_ASSET_FILES_ENTRY,
+  packageAssetMediaType,
+} from '../packages/client/modules/src/assets.ts'
 import { TypeScriptProject } from './ts-project.ts'
 
+export {
+  collectLocalSourceSpecifiers,
+  collectRuntimeLocalSourceSpecifiers,
+  collectRuntimeSourcePackageUses,
+  collectRuntimeSourceSpecifiers,
+  collectSourcePackageUses,
+} from './source-parse-uses.ts'
+import { collectSourceFileUses } from './source-parse-uses.ts'
 const GATE = 'verify-client-packages'
 const CLIENT_MANIFEST_GLOB = 'packages/client/*/package.json'
 const MANIFEST_GLOBS = ['packages/*/*/package.json', 'apps/*/package.json', 'vendor/*/package.json']
@@ -17,20 +31,38 @@ const PLATFORM_SOURCE = 'packages/client/web/src/platform.ts'
 const PARSER_PRELOAD_SOURCE = 'packages/client/modules/src/index.ts'
 const STATIC_PRESET_SOURCE = 'packages/client/tsdown.client.ts'
 const CORDIS = '@deepseek-ai/cordis'
-const DSH_PREFIX = '@deepseek-ai/dsh-'
-const CLIENT_WEB = '@deepseek-ai/dsh-client-web'
+/** Stylesheet requests the dynamic build preset compiles: CSS Modules, global sheets, and `?inline` text. */
+const STYLESHEET_REQUEST = /\.css(?:\?inline)?$/u
+const INLINE_STYLESHEET_QUERY = /\?inline$/u
+
+/** One source location whose reference makes the dynamic build preset emit a package asset. */
+export interface AssetReference {
+  /** Repository-relative, `/`-separated source or stylesheet path. */
+  readonly file: string
+  /** The JSON-quoted module specifier, or `url("<value>")` for a stylesheet reference. */
+  readonly reference: string
+}
 
 /** One workspace package's browser-module declaration. */
 export interface ClientDeclaration {
   readonly name: string
   readonly manifest: string
   readonly dynamic: boolean
+  /** String `dsh.client.platform`; undefined without a row or a string platform. */
+  readonly platform: string | undefined
   readonly external: readonly string[]
   readonly runtimeSourceUses: Readonly<Record<string, readonly string[]>>
   /** Exact runtime specifiers used to validate `dsh.client.external` declarations. */
   readonly runtimeSourceSpecifiers: Readonly<Record<string, readonly string[]>>
   /** Informational package dependencies declared by the row. */
   readonly inject: readonly string[]
+  /** Raw `exports["./assets/*"]` value; undefined when the manifest declares no such subpath. */
+  readonly assetExport: unknown
+  /**
+   * Package-asset references in a dynamic Web row's Client sources under `src/` and in the package stylesheets they
+   * import, sorted by file and then reference; empty for every other package.
+   */
+  readonly assetReferences: readonly AssetReference[]
 }
 
 /** One package directly under packages/client. */
@@ -65,93 +97,88 @@ export interface ClientDeclarations {
  * @param source - Source text to inspect.
  * @returns Bare package names referenced by imports, declarations, or JSX.
  */
-export function collectSourcePackageUses(path: string, source: string): Set<string> {
+export function collectSourceAssetSpecifiers(path: string, source: string): Set<string> {
   const sourceFile = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true)
-  return collectSourceFileUses(sourceFile, false, 'package')
+  return new Set([...collectSourceFileUses(sourceFile, true, 'local')].filter(isAssetSpecifier))
+}
+
+function isAssetSpecifier(specifier: string): boolean {
+  return packageAssetMediaType(specifier) !== undefined
 }
 
 /**
- * Collect bare packages whose values one production source file reaches at runtime.
- * @param path - File path used to select TypeScript's parser mode.
- * @param source - Source text to inspect.
- * @returns Bare package names retained by runtime imports, exports, requires, or JSX.
+ * Collect the relative `url()` values of one stylesheet, which the dynamic build preset resolves to package assets.
+ * @param path - Stylesheet path; a `.module.css` name enables CSS Modules syntax, as in the build preset.
+ * @param source - Stylesheet text.
+ * @returns `url()` values in source order, excluding empty values, fragments, root-relative paths, and URLs with a
+ * scheme such as `data:` or `https:`.
+ * @throws when lightningcss cannot parse the stylesheet; the message names `path`.
  */
-export function collectRuntimeSourcePackageUses(path: string, source: string): Set<string> {
-  const sourceFile = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true)
-  return collectSourceFileUses(sourceFile, true, 'package')
+export function collectStylesheetAssetUrls(path: string, source: string): string[] {
+  const urls: string[] = []
+  try {
+    transform({
+      filename: path,
+      code: Buffer.from(source),
+      cssModules: path.endsWith('.module.css'),
+      visitor: {
+        Url(url) {
+          if (isRelativeStylesheetUrl(url.url)) urls.push(url.url)
+        },
+        // lightningcss does not visit the urls inside image-set(), so its options are read here.
+        Image(image) {
+          if (image.type !== 'image-set') return
+          for (const option of image.value.options) {
+            if (option.image.type === 'url' && isRelativeStylesheetUrl(option.image.value.url)) urls.push(option.image.value.url)
+          }
+        },
+      },
+    })
+  } catch (error) {
+    throw new Error(
+      GATE + ': cannot parse stylesheet ' + path + ': ' + (error instanceof Error ? error.message : String(error)),
+      { cause: error },
+    )
+  }
+  return urls
+}
+
+function isRelativeStylesheetUrl(url: string): boolean {
+  return url !== '' && !url.startsWith('#') && !url.startsWith('/') && !/^[a-z][a-z\d+.-]*:/iu.test(url)
 }
 
 /**
- * Collect exact bare specifiers retained by one production source file.
- * @param path - File path used to select TypeScript's parser mode.
- * @param source - Source text to inspect.
- * @returns Exact specifiers retained by runtime imports, exports, requires, or JSX.
- */
-export function collectRuntimeSourceSpecifiers(path: string, source: string): Set<string> {
-  const sourceFile = ts.createSourceFile(path, source, ts.ScriptTarget.Latest, true)
-  return collectSourceFileUses(sourceFile, true, 'specifier')
-}
-
-function importCarriesRuntimeValue(node: ts.ImportDeclaration): boolean {
-  const clause = node.importClause
-  if (clause === undefined) return true
-  if (clause.phaseModifier === ts.SyntaxKind.TypeKeyword) return false
-  const bindings = clause.namedBindings
-  return clause.name !== undefined
-    || bindings === undefined
-    || ts.isNamespaceImport(bindings)
-    || bindings.elements.length === 0
-    || bindings.elements.some(element => !element.isTypeOnly)
-}
-
-function exportCarriesRuntimeValue(node: ts.ExportDeclaration): boolean {
-  if (node.isTypeOnly) return false
-  const clause = node.exportClause
-  if (clause === undefined || ts.isNamespaceExport(clause)) return true
-  return clause.elements.length === 0 || clause.elements.some(element => !element.isTypeOnly)
-}
-
-function collectSourceFileUses(
-  sourceFile: ts.SourceFile,
-  runtimeOnly: boolean,
-  key: 'package' | 'specifier',
-): Set<string> {
-  const uses = new Set<string>()
-
-  const add = (specifier: ts.Expression | undefined): void => {
-    if (specifier === undefined || !ts.isStringLiteral(specifier) || !isBareSpecifier(specifier.text)) return
-    uses.add(key === 'package' ? packageNameOf(specifier.text) : specifier.text)
-  }
-  const visit = (node: ts.Node): void => {
-    if (ts.isImportDeclaration(node)) {
-      if (!runtimeOnly || importCarriesRuntimeValue(node)) add(node.moduleSpecifier)
-    } else if (ts.isExportDeclaration(node)) {
-      if (!runtimeOnly || exportCarriesRuntimeValue(node)) add(node.moduleSpecifier)
-    } else if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
-      if (!runtimeOnly || !node.isTypeOnly) add(node.moduleReference.expression)
-    } else if (!runtimeOnly && ts.isImportTypeNode(node) && ts.isLiteralTypeNode(node.argument)) {
-      add(node.argument.literal)
-    } else if (ts.isCallExpression(node)
-      && (node.expression.kind === ts.SyntaxKind.ImportKeyword
-        || ts.isIdentifier(node.expression) && node.expression.text === 'require')) {
-      add(node.arguments[0])
-    } else if (!runtimeOnly && ts.isModuleDeclaration(node) && ts.isStringLiteral(node.name)) {
-      add(node.name)
-    } else if (ts.isJsxElement(node) || ts.isJsxSelfClosingElement(node) || ts.isJsxFragment(node)) {
-      uses.add('react')
-    }
-    ts.forEachChild(node, visit)
-  }
-
-  visit(sourceFile)
-  return uses
-}
-
-/**
- * Read browser-module declarations from workspace manifests.
+ * Read package-asset references from the package stylesheets that Client sources import. The dynamic build preset
+ * compiles exactly these stylesheets; a stylesheet no Client source imports, such as a copied static payload, keeps
+ * its `url()` values unchanged.
  * @param root - Absolute repository root.
- * @returns Declarations and malformed dsh.client fields.
+ * @param packageDirectory - Repository-relative, `/`-separated package directory.
+ * @param importers - Repository-relative, `/`-separated Client source paths and their runtime local module specifiers.
+ * @returns Imported `.css` and `.css?inline` stylesheets under the package's `src/`, in path order, and their references.
  */
+export function readStylesheetAssetReferences(
+  root: string,
+  packageDirectory: string,
+  importers: ReadonlyMap<string, Iterable<string>>,
+): { readonly stylesheets: readonly string[]; readonly references: readonly AssetReference[] } {
+  const sourcePrefix = packageDirectory + '/src/'
+  const imported = new Set<string>()
+  for (const [file, specifiers] of importers) {
+    for (const specifier of specifiers) {
+      if (!specifier.startsWith('.') || !STYLESHEET_REQUEST.test(specifier)) continue
+      const stylesheet = posix.join(posix.dirname(file), specifier.replace(INLINE_STYLESHEET_QUERY, ''))
+      if (stylesheet.startsWith(sourcePrefix)) imported.add(stylesheet)
+    }
+  }
+  const stylesheets = [...imported].sort()
+  return {
+    stylesheets,
+    references: stylesheets.flatMap(file =>
+      collectStylesheetAssetUrls(file, readFileSync(resolve(root, file), 'utf8'))
+        .map(url => ({ file, reference: 'url(' + JSON.stringify(url) + ')' }))),
+  }
+}
+
 export function readClientDeclarations(root: string): ClientDeclarations {
   const malformed: string[] = []
   const declarations = globSync(MANIFEST_GLOBS, { cwd: root })
@@ -163,15 +190,15 @@ export function readClientDeclarations(root: string): ClientDeclarations {
 
 /**
  * Return every client package policy violation.
- * @param facts - Package modes, manifests, source uses, and platform module lists.
+ * @param facts - Package modes, manifests, source uses, package-asset references, and platform module lists.
  * @returns Stable self-contained diagnostics.
  */
 export function collectClientPackageViolations(facts: ClientPackageFacts): string[] {
   return [
     ...facts.malformed,
     ...collectModeViolations(facts),
-    ...collectDependencyViolations(facts),
     ...collectModuleViolations(facts),
+    ...collectAssetViolations(facts),
   ].sort((left, right) => left.localeCompare(right))
 }
 
@@ -181,10 +208,8 @@ interface ManifestDocument {
   changed: boolean
 }
 
-type DependencySection = 'dependencies' | 'peerDependencies' | 'devDependencies'
-
 /**
- * Repair manifest declarations whose intended result follows uniquely from the policy.
+ * Repair malformed or redundant `dsh.client` declaration entries.
  * @param root - Absolute repository root.
  * @param facts - Facts used by the verification pass.
  * @returns Repository-relative manifests written by the fixer.
@@ -217,53 +242,6 @@ export function fixClientPackageManifests(root: string, facts: ClientPackageFact
     ) || target.changed
   }
 
-  const staticInputs = new Set([
-    ...facts.staticLinkedPackages,
-    ...facts.platformModules.map(packageNameOf),
-  ])
-  staticInputs.delete(CORDIS)
-  const inferredRanges = dependencyRangeCandidates(root)
-  for (const pkg of facts.packages) {
-    const target = document(pkg.manifest)
-    const expected = expectedSections(pkg, staticInputs)
-    for (const [name, rule] of expected) {
-      const range = preferredRange(target.manifest, name, rule.kind, inferredRanges)
-      if (range === undefined) continue
-      target.changed = rule.kind === 'dependency'
-        ? ensureDependencyOnly(target.manifest, name, range) || target.changed
-        : rule.kind === 'dev'
-          ? ensureDevOnly(target.manifest, name, range) || target.changed
-          : ensurePeerDev(target.manifest, name, range) || target.changed
-    }
-
-    if (pkg.dynamic) {
-      const productionNames = new Set([
-        ...Object.keys(section(target.manifest, 'dependencies')),
-        ...Object.keys(section(target.manifest, 'peerDependencies')),
-      ])
-      for (const name of productionNames) {
-        if (expected.has(name)) continue
-        const range = preferredRange(
-          target.manifest,
-          name,
-          staticInputs.has(name) ? 'dev' : 'peer-dev',
-          inferredRanges,
-        )
-        if (range === undefined) continue
-        if (staticInputs.has(name)) {
-          target.changed = ensureDevOnly(target.manifest, name, range) || target.changed
-        } else if (section(target.manifest, 'dependencies')[name] !== undefined && isInternalDsh(name)) {
-          target.changed = ensurePeerDev(target.manifest, name, range) || target.changed
-        }
-      }
-    }
-
-    for (const [name, range] of Object.entries(section(target.manifest, 'peerDependencies'))) {
-      target.changed = setDependency(target.manifest, 'devDependencies', name, range) || target.changed
-    }
-    target.changed = deleteEmptySections(target.manifest) || target.changed
-  }
-
   const changed = [...documents.values()].filter(target => target.changed).sort((left, right) =>
     left.path.localeCompare(right.path))
   for (const target of changed) {
@@ -293,102 +271,6 @@ function normalizeClientArray(
     client[field] = normalized
   }
   return true
-}
-
-function ensureDevOnly(manifest: Manifest, name: string, range: string): boolean {
-  let changed = deleteDependency(manifest, 'dependencies', name)
-  changed = deleteDependency(manifest, 'peerDependencies', name) || changed
-  return setDependency(manifest, 'devDependencies', name, range) || changed
-}
-
-function ensureDependencyOnly(manifest: Manifest, name: string, range: string): boolean {
-  let changed = deleteDependency(manifest, 'peerDependencies', name)
-  changed = deleteDependency(manifest, 'devDependencies', name) || changed
-  return setDependency(manifest, 'dependencies', name, range) || changed
-}
-
-function ensurePeerDev(manifest: Manifest, name: string, range: string): boolean {
-  let changed = deleteDependency(manifest, 'dependencies', name)
-  changed = setDependency(manifest, 'peerDependencies', name, range) || changed
-  return setDependency(manifest, 'devDependencies', name, range) || changed
-}
-
-function setDependency(manifest: Manifest, field: DependencySection, name: string, range: string): boolean {
-  const dependencies = mutableSection(manifest, field)
-  if (dependencies[name] === range) return false
-  dependencies[name] = range
-  return true
-}
-
-function deleteDependency(manifest: Manifest, field: DependencySection, name: string): boolean {
-  const dependencies = section(manifest, field)
-  if (dependencies[name] === undefined) return false
-  manifest[field] = Object.fromEntries(Object.entries(dependencies).filter(([key]) => key !== name))
-  return true
-}
-
-function deleteEmptySections(manifest: Manifest): boolean {
-  let changed = false
-  for (const field of ['dependencies', 'peerDependencies', 'devDependencies'] as const) {
-    if (manifest[field] === undefined || Object.keys(section(manifest, field)).length > 0) continue
-    if (field === 'dependencies') delete manifest.dependencies
-    else if (field === 'peerDependencies') delete manifest.peerDependencies
-    else delete manifest.devDependencies
-    changed = true
-  }
-  return changed
-}
-
-function preferredRange(
-  manifest: Manifest,
-  name: string,
-  kind: ExpectedRule['kind'],
-  inferred: ReadonlyMap<string, ReadonlySet<string>>,
-): string | undefined {
-  const order: readonly DependencySection[] = kind === 'dependency'
-    ? ['dependencies', 'devDependencies', 'peerDependencies']
-    : kind === 'dev'
-      ? ['devDependencies', 'peerDependencies', 'dependencies']
-      : ['peerDependencies', 'devDependencies', 'dependencies']
-  for (const field of order) {
-    const range = section(manifest, field)[name]
-    if (range !== undefined) return range
-  }
-  if (isInternalDsh(name)) return 'workspace:^'
-  const candidates = inferred.get(name)
-  return candidates?.size === 1 ? [...candidates][0] : undefined
-}
-
-function dependencyRangeCandidates(root: string): Map<string, Set<string>> {
-  const candidates = new Map<string, Set<string>>()
-  const paths = globSync([
-    'package.json',
-    ...MANIFEST_GLOBS,
-    'website/package.json',
-  ], { cwd: root }).map(normalizePath)
-  for (const path of new Set(paths)) {
-    const manifest = JSON.parse(readFileSync(resolve(root, path), 'utf8')) as Manifest
-    for (const field of ['dependencies', 'peerDependencies', 'devDependencies'] as const) {
-      for (const [name, range] of Object.entries(section(manifest, field))) {
-        const ranges = candidates.get(name) ?? new Set<string>()
-        ranges.add(range)
-        candidates.set(name, ranges)
-      }
-    }
-  }
-  return candidates
-}
-
-function section(manifest: Manifest, field: DependencySection): Record<string, string> {
-  return manifest[field] ?? {}
-}
-
-function mutableSection(manifest: Manifest, field: DependencySection): Record<string, string> {
-  const value = manifest[field]
-  if (value !== undefined) return value
-  const created: Record<string, string> = {}
-  manifest[field] = created
-  return created
 }
 
 function collectModeViolations(facts: ClientPackageFacts): string[] {
@@ -433,114 +315,6 @@ function collectModeViolations(facts: ClientPackageFacts): string[] {
     }
   }
   return violations
-}
-
-interface ExpectedRule {
-  readonly kind: 'dependency' | 'dev' | 'peer-dev'
-  readonly origins: Set<string>
-}
-
-function collectDependencyViolations(facts: ClientPackageFacts): string[] {
-  const violations: string[] = []
-  const staticInputs = new Set([
-    ...facts.staticLinkedPackages,
-    ...facts.platformModules.map(packageNameOf),
-  ])
-  staticInputs.delete(CORDIS)
-
-  for (const pkg of [...facts.packages].sort((left, right) => left.manifest.localeCompare(right.manifest))) {
-    const expected = expectedSections(pkg, staticInputs)
-    for (const [name, rule] of [...expected].sort(([left], [right]) => left.localeCompare(right))) {
-      const actual = declaredSections(pkg, name)
-      if (rule.kind === 'dependency') {
-        if (actual.length === 1 && actual[0] === 'dependencies') continue
-        violations.push(
-          pkg.manifest + ': ' + name + ' (' + describeOrigins(rule.origins) + ') is a runtime import'
-          + ' retained by a statically linked artifact; declare it only in dependencies, found '
-          + describeSections(actual),
-        )
-        continue
-      }
-      if (rule.kind === 'dev') {
-        if (actual.length === 1 && actual[0] === 'devDependencies') continue
-        violations.push(
-          pkg.manifest + ': ' + name + ' (' + describeOrigins(rule.origins) + ') is a static client input;'
-          + ' declare it only in devDependencies, found ' + describeSections(actual),
-        )
-        continue
-      }
-
-      const peerRange = pkg.peerDependencies[name]
-      const devRange = pkg.devDependencies[name]
-      if (actual.length === 2
-        && actual.includes('peerDependencies')
-        && actual.includes('devDependencies')
-        && peerRange === devRange) continue
-      violations.push(
-        pkg.manifest + ': ' + name + ' (' + describeOrigins(rule.origins) + ')'
-        + ' is a peer-installed DSH relationship; declare it in peerDependencies and devDependencies'
-        + ' with matching ranges, not dependencies; found ' + describeSections(actual)
-        + describeRangeMismatch(peerRange, devRange),
-      )
-    }
-
-    for (const [name, peerRange] of Object.entries(pkg.peerDependencies).sort(([left], [right]) => left.localeCompare(right))) {
-      if (expected.has(name)) continue
-      const devRange = pkg.devDependencies[name]
-      if (devRange === peerRange) continue
-      violations.push(
-        pkg.manifest + ': peerDependencies.' + name + ' is ' + peerRange + ', so devDependencies.' + name
-        + ' must use the same range; found ' + (devRange ?? 'no declaration'),
-      )
-    }
-
-    if (!pkg.dynamic) continue
-    for (const section of ['dependencies', 'peerDependencies'] as const) {
-      for (const name of Object.keys(pkg[section]).sort()) {
-        if (expected.has(name)) continue
-        if (staticInputs.has(name)) {
-          violations.push(
-            pkg.manifest + ': dynamic package declares static input ' + name + ' in ' + section + ';'
-            + ' move it to devDependencies or delete the stale declaration',
-          )
-        } else if (section === 'dependencies' && isInternalDsh(name)) {
-          violations.push(
-            pkg.manifest + ': dynamic package declares ' + name + ' in dependencies;'
-            + ' dynamic DSH relationships are peer plus dev, and static client inputs are dev-only',
-          )
-        }
-      }
-    }
-  }
-  return violations
-}
-
-function expectedSections(pkg: ClientPackage, staticInputs: ReadonlySet<string>): Map<string, ExpectedRule> {
-  const expected = new Map<string, ExpectedRule>([
-    [CORDIS, { kind: 'peer-dev', origins: new Set(['client package baseline']) }],
-  ])
-  if (!pkg.dynamic) {
-    if (pkg.name === CLIENT_WEB) return expected
-    for (const [name, locations] of Object.entries(pkg.runtimeSourceUses)) {
-      if (name === pkg.name || name === CORDIS || isInternalDsh(name)) continue
-      expected.set(name, { kind: 'dependency', origins: new Set(locations) })
-    }
-    return expected
-  }
-
-  const add = (name: string, origin: string): void => {
-    if (name === pkg.name) return
-    const kind = staticInputs.has(name) ? 'dev' : isInternalDsh(name) ? 'peer-dev' : undefined
-    if (kind === undefined) return
-    const current = expected.get(name)
-    if (current !== undefined) current.origins.add(origin)
-    else expected.set(name, { kind, origins: new Set([origin]) })
-  }
-  for (const [name, locations] of Object.entries(pkg.sourceUses)) {
-    for (const location of locations) add(name, location)
-  }
-  for (const name of pkg.inject) add(name, 'dsh.client.inject')
-  return expected
 }
 
 interface ModuleEdge {
@@ -667,9 +441,51 @@ function formatCycle(
   return manifest + ': synchronous dsh.client.external cycle: ' + chain + ' ' + (entry?.from ?? '')
 }
 
+/** Whether the dynamic build preset builds this package's browser face, the only face that emits package assets. */
+function buildsDynamicWebClient(declaration: ClientDeclaration): boolean {
+  return declaration.dynamic && declaration.platform === 'web'
+}
+
+function collectAssetViolations(facts: ClientPackageFacts): string[] {
+  const violations: string[] = []
+  const exportKey = 'exports[' + JSON.stringify(PACKAGE_ASSET_EXPORT) + ']'
+  for (const pkg of facts.declarations) {
+    const declared = pkg.assetExport !== undefined
+    const covered = buildsDynamicWebClient(pkg)
+    if (declared && pkg.assetExport !== PACKAGE_ASSET_EXPORT_TARGET) {
+      violations.push(
+        pkg.manifest + ': ' + exportKey + ' is ' + JSON.stringify(pkg.assetExport)
+        + '; it must be exactly ' + JSON.stringify(PACKAGE_ASSET_EXPORT_TARGET),
+      )
+    }
+    if (declared && !covered) {
+      violations.push(
+        pkg.manifest + ': ' + pkg.name + ' declares ' + exportKey + ' without a dsh.client row for platform "web";'
+        + ' only dynamic Web Client packages publish package assets',
+      )
+    }
+    if (!covered) continue
+    const first = pkg.assetReferences[0]
+    if (!declared && first !== undefined) {
+      violations.push(
+        pkg.manifest + ': ' + pkg.name + ' references package asset ' + first.reference + ' in ' + first.file
+        + ' but declares no ' + exportKey + '; add ' + JSON.stringify(PACKAGE_ASSET_EXPORT) + ': '
+        + JSON.stringify(PACKAGE_ASSET_EXPORT_TARGET) + ' and publish ' + JSON.stringify(PACKAGE_ASSET_FILES_ENTRY),
+      )
+    } else if (declared && first === undefined) {
+      violations.push(
+        pkg.manifest + ': ' + pkg.name + ' declares an unused ' + PACKAGE_ASSET_EXPORT + ' export;'
+        + ' no Client source or stylesheet it imports references a package asset',
+      )
+    }
+  }
+  return violations
+}
+
 interface Manifest {
   name?: unknown
   dsh?: unknown
+  exports?: unknown
   dependencies?: Record<string, string>
   peerDependencies?: Record<string, string>
   devDependencies?: Record<string, string>
@@ -684,27 +500,27 @@ function readDeclaration(
   if (typeof manifest.name !== 'string') return undefined
   const dsh = isRecord(manifest.dsh) ? manifest.dsh : undefined
   const rawClient = dsh?.client
-  if (rawClient === undefined) {
-    return {
-      name: manifest.name, manifest: manifestPath, dynamic: false, external: [], inject: [],
-      runtimeSourceUses: {}, runtimeSourceSpecifiers: {},
-    }
-  }
+  const assetExport = isRecord(manifest.exports) ? manifest.exports[PACKAGE_ASSET_EXPORT] : undefined
+  const rowless = {
+    name: manifest.name, manifest: manifestPath, dynamic: false, platform: undefined, external: [], inject: [],
+    runtimeSourceUses: {}, runtimeSourceSpecifiers: {}, assetExport, assetReferences: [],
+  } satisfies ClientDeclaration
+  if (rawClient === undefined) return rowless
   if (!isRecord(rawClient)) {
     malformed.push(manifestPath + ': ' + manifest.name + ' dsh.client must be an object')
-    return {
-      name: manifest.name, manifest: manifestPath, dynamic: false, external: [], inject: [],
-      runtimeSourceUses: {}, runtimeSourceSpecifiers: {},
-    }
+    return rowless
   }
   return {
     name: manifest.name,
     manifest: manifestPath,
     dynamic: true,
+    platform: typeof rawClient.platform === 'string' ? rawClient.platform : undefined,
     external: stringArray(rawClient.external, manifest.name, manifestPath, 'external', malformed),
     inject: stringArray(rawClient.inject, manifest.name, manifestPath, 'inject', malformed),
     runtimeSourceUses: {},
     runtimeSourceSpecifiers: {},
+    assetExport,
+    assetReferences: [],
   }
 }
 
@@ -790,9 +606,13 @@ async function readFacts(root: string): Promise<ClientPackageFacts> {
   const staticLinkedPackages = await readStaticLinkedRoster(root)
   const project = new TypeScriptProject(root, 'client')
   const sourceFiles = project.sourceFiles()
+  let webStylesheets = 0
   const declarations = bareDeclarations.map((declaration): ClientDeclaration => {
     const runtimeSourceUses = new Map<string, Set<string>>()
     const runtimeSourceSpecifiers = new Map<string, Set<string>>()
+    const assetReferences: AssetReference[] = []
+    const scansAssets = buildsDynamicWebClient(declaration)
+    const importers = new Map<string, ReadonlySet<string>>()
     const sourcePrefix = dirname(declaration.manifest) + '/src/'
     for (const sourceFile of sourceFiles) {
       if (sourceFile.isDeclarationFile) continue
@@ -808,6 +628,24 @@ async function readFacts(root: string): Promise<ClientPackageFacts> {
         locations.add(file)
         runtimeSourceSpecifiers.set(specifier, locations)
       }
+      if (!scansAssets) continue
+      const localSpecifiers = collectSourceFileUses(sourceFile, true, 'local')
+      importers.set(file, localSpecifiers)
+      for (const specifier of localSpecifiers) {
+        if (isAssetSpecifier(specifier)) assetReferences.push({ file, reference: JSON.stringify(specifier) })
+      }
+    }
+    if (scansAssets) {
+      // A Web row always has a browser half, so an empty source set means the Client program stopped covering it.
+      if (importers.size === 0) {
+        throw new Error(
+          GATE + ': the Client program loads no source under ' + sourcePrefix + ' for dynamic Web row '
+          + declaration.name + '; its package-asset references cannot be read',
+        )
+      }
+      const stylesheets = readStylesheetAssetReferences(root, dirname(declaration.manifest), importers)
+      webStylesheets += stylesheets.stylesheets.length
+      assetReferences.push(...stylesheets.references)
     }
     return {
       ...declaration,
@@ -819,8 +657,13 @@ async function readFacts(root: string): Promise<ClientPackageFacts> {
         [...runtimeSourceSpecifiers].sort(([left], [right]) => left.localeCompare(right))
           .map(([specifier, locations]) => [specifier, [...locations].sort()]),
       ),
+      assetReferences: assetReferences.sort((left, right) =>
+        left.file.localeCompare(right.file) || left.reference.localeCompare(right.reference)),
     }
   })
+  if (webStylesheets === 0) {
+    throw new Error(GATE + ': no dynamic Web row imports a stylesheet from its src/ directory; the stylesheet scan read an empty corpus')
+  }
   const byManifest = new Map(declarations.map(entry => [entry.manifest, entry]))
   const packages: ClientPackage[] = []
 
@@ -895,36 +738,6 @@ function rowPackageOf(specifier: string, rows: ReadonlySet<string>): string | un
   return rows.has(stripped) ? stripped : undefined
 }
 
-function declaredSections(pkg: ClientPackage, name: string): string[] {
-  return (['dependencies', 'peerDependencies', 'devDependencies'] as const)
-    .filter(section => pkg[section][name] !== undefined)
-}
-
-function describeSections(sections: readonly string[]): string {
-  return sections.length === 0 ? 'no dependency declaration' : sections.join(' + ')
-}
-
-function describeRangeMismatch(peer: string | undefined, dev: string | undefined): string {
-  if (peer === undefined || dev === undefined || peer === dev) return ''
-  return ' (peer ' + peer + ', dev ' + dev + ')'
-}
-
-function describeOrigins(origins: ReadonlySet<string>): string {
-  const sorted = [...origins].sort()
-  const [first, second, ...rest] = sorted
-  if (first === undefined) return 'production use'
-  if (second === undefined) return first
-  return rest.length === 0 ? first + ', ' + second : first + ', ' + second + ', and ' + String(rest.length) + ' more'
-}
-
-function isInternalDsh(name: string): boolean {
-  return name === CORDIS || name.startsWith(DSH_PREFIX)
-}
-
-function isBareSpecifier(specifier: string): boolean {
-  return !specifier.startsWith('.') && !specifier.startsWith('/') && !specifier.startsWith('#')
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
@@ -954,10 +767,12 @@ async function main(): Promise<void> {
 
   const dynamic = facts.packages.filter(pkg => pkg.dynamic).length
   const requests = facts.declarations.reduce((total, pkg) => total + pkg.external.length, 0)
+  const assetExports = facts.declarations.filter(pkg => pkg.assetExport !== undefined).length
   console.log(
     GATE + ': ' + String(facts.packages.length) + ' client packages (' + String(dynamic) + ' dynamic, '
-    + String(facts.packages.length - dynamic) + ' statically linked) satisfy dependency and module-request rules; '
-    + String(requests) + ' explicit external request(s).',
+    + String(facts.packages.length - dynamic) + ' statically linked) satisfy package-mode, module-request, and '
+    + 'package-asset rules; ' + String(requests) + ' explicit external request(s), ' + String(assetExports)
+    + ' package-asset export(s).',
   )
 }
 

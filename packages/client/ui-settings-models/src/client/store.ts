@@ -7,12 +7,13 @@
  * re-renders from the next describe, pushed or refetched.
  */
 
+import type { Context as ClientContext } from '@deepseek-ai/cordis'
 import type {
-  ClientRemote, CredentialInfo, LlmConfigurableProvider, LlmProviderInfo, SettingsNamespaceView,
+  CredentialInfo, LlmConfigurableProvider, LlmNativeAuth, LlmProviderInfo, SettingsNamespaceView,
 } from '@deepseek-ai/dsh-api-remotes/client'
 import type { SnapshotStore } from '@deepseek-ai/dsh-client-store'
 import { createSnapshotStore } from '@deepseek-ai/dsh-client-store'
-import type { SettingsDescribeFace, SettingsRemote } from '@deepseek-ai/dsh-client-ui-settings/client'
+import type { SettingsDescribeFace } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { SettingsSchemaOperations } from './schema-operations.ts'
 
 /**
@@ -20,15 +21,6 @@ import type { SettingsSchemaOperations } from './schema-operations.ts'
  * names one that cannot collide with a configured route.
  */
 const PROBE_ROUTE = '\u0000probe'
-
-/** The credentials Remote methods the Models page reads and writes through. */
-export type ModelsCredentials = Pick<ClientRemote['credentials'], 'describe' | 'set' | 'unset'>
-
-/** LLM Remote methods used by the Models page. */
-export type ModelsLlm = Pick<
-  ClientRemote['llm'],
-  'discoverModels' | 'listConfigurableProviders' | 'listProviders'
->
 
 /** One provider row after joining the configurable directory with live routes. */
 export interface ProviderDirectoryEntry {
@@ -38,13 +30,17 @@ export interface ProviderDirectoryEntry {
   readonly settingsPath: readonly string[]
   readonly active: boolean
   readonly declared?: boolean
+  readonly defaultBaseURL?: string
+  readonly baseURLEnv?: readonly string[]
+  readonly nativeAuth?: LlmNativeAuth
+  readonly error?: string
 }
 
 /**
  * Join declared configurable providers with the currently registered routes.
  * @param registered - live provider routes in registration order.
  * @param directory - declared configurable providers in declaration order.
- * @returns declared rows followed by live routes with no declaration.
+ * @returns account and official routes first, then other routes in their original order.
  */
 export function joinProviderDirectory(
   registered: readonly LlmProviderInfo[],
@@ -59,6 +55,10 @@ export function joinProviderDirectory(
     settingsPath: [...entry.settingsPath],
     active: active.has(entry.provider),
     ...entry.declared === undefined ? {} : { declared: entry.declared },
+    ...entry.defaultBaseURL === undefined ? {} : { defaultBaseURL: entry.defaultBaseURL },
+    ...entry.baseURLEnv === undefined ? {} : { baseURLEnv: entry.baseURLEnv },
+    ...entry.nativeAuth === undefined ? {} : { nativeAuth: entry.nativeAuth },
+    ...entry.error === undefined ? {} : { error: entry.error },
   }))
   for (const provider of registered) {
     if (declared.has(provider.id)) continue
@@ -70,23 +70,15 @@ export function joinProviderDirectory(
       active: true,
     })
   }
-  return rows
-}
-
-/**
- * Every Remote wire face the Models page reaches.
- */
-export interface ModelsWire {
-  /** The settings Remote namespace: the redacted read and the profile writes. */
-  settings: SettingsRemote
-  /** Credential state and writes for the references provider profiles name. */
-  credentials: ModelsCredentials
-  /** Provider directory reads and draft endpoint discovery. */
-  llm: ModelsLlm
+  return rows.toSorted((left, right) =>
+    (left.provider === 'deepseek-account' ? 0 : left.provider === 'deepseek-official' ? 1 : 2)
+      - (right.provider === 'deepseek-account' ? 0 : right.provider === 'deepseek-official' ? 1 : 2))
 }
 
 /** One provider row the page renders. */
 export interface ProviderRow {
+  /** Account route has usable credentials for the configured inference origin. */
+  accountAvailable?: boolean
   /** The directory entry (route id, display name, settings address, live state). */
   entry: ProviderDirectoryEntry
   /** Whether any layer configures this provider (its profile resolves). */
@@ -104,6 +96,8 @@ export interface ProviderRow {
    * own derivation rule.
    */
   derivedCredential?: CredentialInfo
+  /** Redacted checks for named or native references; absent when their read failed. */
+  credentialChecks?: Readonly<Record<string, CredentialInfo>>
 }
 
 /** Page snapshot. */
@@ -119,17 +113,6 @@ export interface ModelsSettingsState {
   rows: readonly ProviderRow[]
   /** Namespace views by ns, for the editor's schema/layers/secrets. */
   namespaces: ReadonlyMap<string, SettingsNamespaceView>
-}
-
-/**
- * Human text for a rejected wire call. A transport failure rejects with an
- * Error; a host or a runtime can reject with anything, and the page still has
- * to say something.
- * @param error - the rejection value.
- * @returns the message to show.
- */
-export function messageOf(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
 }
 
 /**
@@ -163,6 +146,28 @@ export function protocolChoices(
   return list.list.map(entry => entry.value).filter((value): value is string => typeof value === 'string')
 }
 
+/**
+ * The reasoning levels a hand-declared route's models may declare, read out of
+ * the owning namespace's own schema for the same reason as
+ * {@link protocolChoices}: the levels the page offers and the keys the
+ * adapter accepts in `reasoningEfforts` come from the same `Config`.
+ * @param namespace - the namespace view whose schema declares the profile shape.
+ * @param schema - settings schema operations.
+ * @returns the levels in the schema's escalation order, or an empty list when the schema has none.
+ */
+export function reasoningLevelChoices(
+  namespace: SettingsNamespaceView | undefined,
+  schema: SettingsSchemaOperations,
+): string[] {
+  if (namespace === undefined) return []
+  const path = ['providers', PROBE_ROUTE, 'models', '0', 'reasoningEfforts']
+  const node = schema.nodeAtPath(schema.rehydrate(namespace.schema), path)
+  // `false | { [level]: value }`: the dict branch's key schema lists the levels.
+  const branches = (node as { list?: readonly { type?: string; sKey?: unknown }[] } | undefined)?.list ?? []
+  const keys = branches.find(branch => branch.type === 'dict')?.sKey as { list?: readonly { value?: unknown }[] } | undefined
+  return (keys?.list ?? []).map(entry => entry.value).filter((value): value is string => typeof value === 'string')
+}
+
 /** The credential reference a resolved profile names (its `apiKeyEnv` field). */
 function apiKeyEnvOf(
   namespace: SettingsNamespaceView | undefined,
@@ -185,13 +190,17 @@ export class ModelsSettingsStore {
 
   /** Latest load wins; an older response never overwrites a newer one. */
   private generation = 0
+  /** Callers follow the current refresh's outcome, including callers whose read was superseded. */
+  private readonly pendingLoads = new Set<PromiseWithResolvers<void>>()
 
   /**
-   * @param api - the page's credentials Remote and LLM wire faces.
+   * @param ctx - the page plugin's context, whose `remote.llm` and
+   * `remote.credentials` namespaces carry the directory and credential reads.
+   * @param schema - settings-owned schema and immutable path operations.
    * @param describeFace - the shared mirror's describe face (namespace views and writability).
    */
   constructor(
-    private readonly api: Pick<ModelsWire, 'credentials' | 'llm'>,
+    private readonly ctx: ClientContext,
     private readonly schema: SettingsSchemaOperations,
     private readonly describeFace: SettingsDescribeFace,
   ) {}
@@ -201,38 +210,43 @@ export class ModelsSettingsStore {
    * settings answer in parallel, then one batched credential describe over
    * every referenced ref. Provider failure or absence of an initial settings
    * answer keeps the last good rows and surfaces an error; a failed settings
-   * refresh reuses the mirror's held view.
-   * @returns nothing; the snapshot carries the outcome.
+   * refresh reuses the mirror's held view. Concurrent callers resolve only
+   * after the current refresh publishes its ready or error snapshot.
+   * @returns resolution after the current snapshot is published.
+   * @throws the current read's unexpected rejection; superseded rejections are ignored.
    */
-  async load(): Promise<void> {
+  load(): Promise<void> {
+    const pending = Promise.withResolvers<void>()
+    this.pendingLoads.add(pending)
     const generation = ++this.generation
+    void this.read(generation).then(
+      () => { this.settleLoads(generation, (load) => { load.resolve() }) },
+      (error: unknown) => { this.settleLoads(generation, (load) => { load.reject(error) }) },
+    )
+    return pending.promise
+  }
+
+  /** Publish one joined answer; stale answers leave the current refresh in charge. */
+  private async read(generation: number): Promise<void> {
     this.store.update((s) => { s.status = 'loading'; s.error = null })
-    let providers: ProviderDirectoryEntry[]
-    let writable: boolean
-    let views: readonly SettingsNamespaceView[]
-    try {
-      const [registered, declared] = await Promise.all([
-        this.api.llm.listProviders(),
-        this.api.llm.listConfigurableProviders(),
-        this.describeFace.ensure(),
-      ])
-      if (!registered.ok) throw new Error(registered.error.message)
-      if (!declared.ok) throw new Error(declared.error.message)
-      const mirrored = this.describeFace.getSnapshot()
-      if (mirrored.view === undefined) {
-        throw new Error(mirrored.error ?? 'settings are unavailable in this browser')
-      }
-      providers = joinProviderDirectory(registered.value, declared.value)
-      writable = mirrored.view.writable
-      views = mirrored.view.namespaces
-    } catch (error) {
-      if (generation !== this.generation) return
-      this.store.update((s) => {
-        s.status = 'error'
-        s.error = error instanceof Error ? error.message : String(error)
-      })
+    const [registered, declared] = await Promise.all([
+      this.ctx.remote.llm.listProviders(),
+      this.ctx.remote.llm.listConfigurableProviders(),
+      this.describeFace.ensure(),
+    ])
+    if (generation !== this.generation) return
+    if (!registered.ok) { this.failLoad(registered.error.message); return }
+    if (!declared.ok) { this.failLoad(declared.error.message); return }
+    const mirrored = this.describeFace.getSnapshot()
+    if (mirrored.view === undefined) {
+      /* v8 ignore next -- SettingsDescribeFace.ensure settles with a view or the read's error */
+      if (mirrored.error === null) throw new Error('settings describe settled with neither a view nor an error')
+      this.failLoad(mirrored.error)
       return
     }
+    const providers = joinProviderDirectory(registered.value, declared.value)
+    const writable = mirrored.view.writable
+    const views: readonly SettingsNamespaceView[] = mirrored.view.namespaces
     const namespaces = new Map(views.map(view => [view.ns, view]))
     const rows: ProviderRow[] = providers.map((entry) => {
       const namespace = namespaces.get(entry.settingsNs)
@@ -246,24 +260,29 @@ export class ModelsSettingsStore {
         entry,
         configured,
         removable,
-        apiKeyEnv: apiKeyEnvOf(namespace, entry.settingsPath, this.schema),
+        apiKeyEnv: entry.provider === 'deepseek-account' ? undefined : apiKeyEnvOf(namespace, entry.settingsPath, this.schema),
         credential: undefined,
       }
     })
-    const refs = [...new Set(rows.map(row => row.apiKeyEnv ?? deriveKeyRef(row.entry.provider)))]
-    let credentials: Record<string, CredentialInfo> = {}
-    let credentialError: string | null = null
-    if (refs.length > 0) {
-      try {
-        const response = await this.api.credentials.describe(refs)
-        // Credential state is an enrichment for the Models page: neither a
-        // business rejection nor a transport failure fails the load. The
-        // onboarding projection below retains the failure distinction.
-        if (response.ok) credentials = response.value
-        else credentialError = response.error.message
-      } catch (error) {
-        credentialError = messageOf(error)
+    if (rows.some(row => row.entry.provider === 'deepseek-account')) {
+      const catalog = await this.ctx.remote.session.modelCatalog()
+      for (const row of rows) {
+        if (row.entry.provider === 'deepseek-account') row.accountAvailable = catalog.ok
+          && catalog.value.groups.some(group => group.id === 'deepseek-account' && group.models.length > 0)
       }
+    }
+    const refs = [...new Set(rows.filter(row => row.entry.provider !== 'deepseek-account').flatMap(row =>
+      row.apiKeyEnv === undefined ? [deriveKeyRef(row.entry.provider), ...row.entry.nativeAuth?.env ?? []] : [row.apiKeyEnv]))]
+    const credentials: Record<string, CredentialInfo> = {}
+    let credentialError: string | null = null
+    // credentials.describe accepts at most 64 references per request.
+    for (let index = 0; index < refs.length; index += 64) {
+      const response = await this.ctx.remote.credentials.describe(refs.slice(index, index + 64))
+      // Credential state is an enrichment for the Models page: a failure
+      // degrades the badge instead of failing the load. The onboarding
+      // projection below retains the failure distinction.
+      if (response.ok) Object.assign(credentials, response.value)
+      else { credentialError = response.error.message; break }
     }
     if (generation !== this.generation) return
     this.store.update((s) => {
@@ -271,16 +290,40 @@ export class ModelsSettingsStore {
       s.error = null
       s.credentialError = credentialError
       s.writable = writable
-      s.rows = rows.map((row) => {
+      s.rows = rows.filter(row => row.entry.provider !== 'deepseek-account' || row.accountAvailable === true).map((row) => {
+        if (row.entry.provider === 'deepseek-account') return row
         const named = row.apiKeyEnv === undefined ? undefined : credentials[row.apiKeyEnv]
         const derived = row.apiKeyEnv !== undefined ? undefined : credentials[deriveKeyRef(row.entry.provider)]
         return {
           ...row,
           ...named === undefined ? {} : { credential: named },
           ...derived === undefined ? {} : { derivedCredential: derived },
+          ...credentialError === null ? { credentialChecks: Object.fromEntries(
+            (row.apiKeyEnv === undefined ? row.entry.nativeAuth?.env ?? [] : [row.apiKeyEnv])
+              .flatMap((ref) => {
+                const info = credentials[ref]
+                return info === undefined ? [] : [[ref, info] as const]
+              }),
+          ) } : {},
         }
       })
       s.namespaces = namespaces
+    })
+  }
+
+  /** Settle callers only while this read still owns the current refresh. */
+  private settleLoads(generation: number, settle: (load: PromiseWithResolvers<void>) => void): void {
+    if (generation !== this.generation) return
+    const pending = [...this.pendingLoads]
+    this.pendingLoads.clear()
+    for (const load of pending) settle(load)
+  }
+
+  /** Publish the current joined read's failure text. */
+  private failLoad(message: string): void {
+    this.store.update((s) => {
+      s.status = 'error'
+      s.error = message
     })
   }
 }
@@ -297,6 +340,7 @@ export class ModelsSettingsStore {
  */
 export function providerUsable(row: ProviderRow): boolean {
   if (!row.entry.active) return false
+  if (row.entry.provider === 'deepseek-account') return row.accountAvailable === true
   if (row.apiKeyEnv === undefined) return true
   return row.credential?.configured === true
 }

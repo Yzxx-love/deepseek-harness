@@ -1,13 +1,13 @@
 /** Serialized Team transactions over the exact live Lead Session log. */
 
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { ProjectionHandle } from '@deepseek-ai/dsh-session-projection'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionEventMap, SessionId } from '@deepseek-ai/dsh-session'
-import { foldTeam } from './fold.ts'
-import type { TeamEventType, TeamFoldState } from './fold.ts'
+import type { TeamEventType, TeamProjectionState, TeamState } from './projection.ts'
 
 type AppendTeamEvent = <T extends TeamEventType>(type: T, data: SessionEventMap[T]) => void
-type MutableTeamEventType = 'team/member' | 'team/task' | 'team/message/queued' | 'team/message/delivered'
+type MutableTeamEventType = 'team/member' | 'team/task'
 
 /** Owns per-Lead transaction order and committed Team event publication. */
 export class TeamJournal {
@@ -15,20 +15,25 @@ export class TeamJournal {
 
   /**
    * @param ctx - Team service context with the injected Session service.
+   * @param teamProjectionHandle - Team state registration owned by the Team service.
    * @param onCommit - synchronous notification after the Team event flush succeeds.
    */
   constructor(
     private readonly ctx: Context,
+    private readonly teamProjectionHandle: ProjectionHandle<TeamProjectionState>,
     private readonly onCommit: (root: Agent) => void,
   ) {}
 
   /**
-   * Fold authoritative Team state for one exact live Lead.
+   * Read authoritative Team state for one exact live Lead.
    * @param root - exact live Team Lead.
-   * @returns current replay state selected by the Lead Team id.
+   * @returns current projected state selected by the Lead Team id.
+   * @throws when the durable Team projection has failed.
    */
-  state(root: Agent): TeamFoldState {
-    return foldTeam(root.id, root.session.events)
+  state(root: Agent): TeamState {
+    const projection = this.teamProjectionHandle.stateOf(root.session)
+    if (projection.failure !== undefined) throw new Error(projection.failure)
+    return projection
   }
 
   /**

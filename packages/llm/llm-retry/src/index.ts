@@ -8,9 +8,10 @@
 import { randomUUID } from 'node:crypto'
 import type { Context, Events } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { z as zod } from 'zod'
 import type { Agent, RequestErrorAction } from '@deepseek-ai/dsh-agent'
 import type { LlmFailure, ResolvedRetryPolicy } from '@deepseek-ai/dsh-llm'
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import type {} from '@deepseek-ai/dsh-session-projection'
 import { RetryId } from './brand.ts'
 import type { LlmRetryEventData } from './types.ts'
 
@@ -18,7 +19,7 @@ export type { LlmRetryEventData, LlmRetryStartedEventData } from './types.ts'
 export { RetryId } from './brand.ts'
 
 export const name = 'llm-retry'
-export const inject = ['agents']
+export const inject = ['agents', 'sessionProjections']
 
 /** This policy executor has no config; providers own `retryPolicy`. */
 export type Config = Readonly<Record<string, never>>
@@ -75,6 +76,10 @@ function retryPolicyKey(policy: ResolvedRetryPolicy): string {
     ])
 }
 
+function retryStateKey(provider: string, policyKey: string): string {
+  return JSON.stringify([provider, policyKey])
+}
+
 function cancellableDelay(delayMs: number, signal: AbortSignal): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(false)
   return new Promise((resolve) => {
@@ -90,14 +95,44 @@ function cancellableDelay(delayMs: number, signal: AbortSignal): Promise<boolean
   })
 }
 
+interface RetryStateEntry {
+  retry: number
+  retryId: RetryId
+}
+
+type LlmRetryState = Record<string, RetryStateEntry>
+
+// The cast bridges the branded retry id, which Zod cannot express directly.
+const llmRetryStateSchema: zod.ZodType<LlmRetryState> = zod.record(zod.string(), zod.object({
+  retry: zod.number().int().nonnegative(),
+  retryId: zod.string(),
+})) as unknown as zod.ZodType<LlmRetryState>
+
 /**
  * Install provider-routed normal or unbounded request recovery.
+ * Recovery admitted during activation awaits projection registration. A
+ * registration failure propagates; cancellation or disposal suppresses retries.
  * @param ctx - plugin context that owns the listener and active waits.
  * @param config - empty executor config; provider registrations own policy.
  * @param internals - non-serializable deterministic hooks for tests.
+ * @returns when recovery listeners and their projection are ready.
  */
-export function apply(ctx: Context, config: Config = {}, internals: RetryInternals = {}): void {
+export async function apply(ctx: Context, config: Config = {}, internals: RetryInternals = {}): Promise<void> {
   validateConfig(config)
+  const projectionReady = ctx.sessionProjections.register({
+    key: 'llmRetry',
+    stateVersion: 1,
+    stateSchema: llmRetryStateSchema,
+    init: () => ({}),
+    apply: (state, event) => {
+      if (event.type === 'step/start' || event.type === 'turn/end') return {}
+      if (event.type !== 'llm/retry') return state
+      const key = retryStateKey(event.data.provider, event.data.policyKey)
+      const entry = state[key]
+      if (entry?.retry === event.data.retry && entry.retryId === event.data.retryId) return state
+      return { ...state, [key]: { retry: event.data.retry, retryId: event.data.retryId } }
+    },
+  })
   const random = internals.random ?? Math.random
   const lifetime = new AbortController()
   const active = new Set<Promise<RequestErrorAction>>()
@@ -122,7 +157,6 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
     signal: AbortSignal,
   ): Promise<RequestErrorAction> {
     const fusedSignal = AbortSignal.any([signal, lifetime.signal])
-    if (fusedSignal.aborted) return
     const eventData: LlmRetryEventData = policy.mode === 'normal'
       ? {
         retryId,
@@ -158,8 +192,9 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
     next: () => Promise<RequestErrorAction>,
   ): Promise<RequestErrorAction> {
     if (policy === undefined) return next()
+    const llmRetryProjectionHandle = await projectionReady
+    if (signal.aborted || ctx.fiber.uid === null || lifetime.signal.aborted) return
     if (policy.mode === 'always') {
-      if (signal.aborted || lifetime.signal.aborted) return
       const fusedSignal = AbortSignal.any([signal, lifetime.signal])
       // The loop and plugin lifetime stay open until delegated recovery settles.
       // An abort then wins before the decision or fallback can mutate later state.
@@ -179,17 +214,12 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
     }
 
     const policyKey = retryPolicyKey(policy)
-    const priorPolicyRetry = agent.session.events.findLast((event): event is SessionEvent<'llm/retry'> =>
-      event.type === 'llm/retry'
-      && event.data.turn === turn
-      && event.data.step === step
-      && event.data.provider === provider
-      && event.data.policyKey === policyKey,
-    )
-    const previousRetry = priorPolicyRetry?.data.retry ?? 0
+    const retryState = llmRetryProjectionHandle.stateOf(agent.session)
+    const previous = retryState[retryStateKey(provider, policyKey)]
+    const previousRetry = previous?.retry ?? 0
     if (policy.mode === 'normal' && previousRetry >= policy.maxRetries) return next()
     const retry = previousRetry + 1
-    const retryId = priorPolicyRetry?.data.retryId ?? RetryId(randomUUID())
+    const retryId = previous?.retryId ?? RetryId(randomUUID())
     let delayMs: number
     if (failure.providerRetryAfterMs !== undefined
       && Number.isFinite(failure.providerRetryAfterMs)
@@ -223,4 +253,5 @@ export function apply(ctx: Context, config: Config = {}, internals: RetryInterna
     lifetime.abort(new Error('llm-retry plugin disposed'))
     await Promise.allSettled([...active])
   }, 'llm-retry: abort and drain active recovery')
+  await projectionReady
 }

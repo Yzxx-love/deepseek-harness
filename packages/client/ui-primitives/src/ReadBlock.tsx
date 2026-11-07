@@ -1,13 +1,16 @@
-import { useCallback, useMemo, useState, useSyncExternalStore } from 'react'
+import { useCallback, useMemo, useRef, useState, useSyncExternalStore, type CSSProperties } from 'react'
 import clsx from 'clsx'
 import { FoldToggle } from './FoldToggle.tsx'
 import { writeClipboard } from './clipboard.ts'
+import { CodeToolbar, type CodeToolbarLabels } from './CodeToolbar.tsx'
+import cardCss from './CodeCard.module.css'
 import {
   grammarLoadCount,
   highlightLines,
   subscribeGrammarLoaded,
   type HighlightSpan,
 } from './markdown/highlight.ts'
+import { useViewportHighlighting } from './markdown/useViewportHighlighting.ts'
 import css from './ReadBlock.module.css'
 
 /**
@@ -43,7 +46,7 @@ export interface ReadBlockProps {
 }
 
 /** Localized chrome for {@link ReadBlock}. */
-export interface ReadBlockLabels {
+export interface ReadBlockLabels extends CodeToolbarLabels {
   window: (shown: number, total: number) => string
   copy: string
   copied: string
@@ -72,6 +75,8 @@ export function ReadBlock({
   maxLines = DEFAULT_READ_MAX_LINES,
   className,
 }: ReadBlockProps) {
+  const rootRef = useRef<HTMLDivElement>(null)
+  const highlighting = useViewportHighlighting(rootRef, lang)
   // Whole-window highlighting preserves multiline grammar context; copy uses
   // the same text without gutter or banner chrome.
   const raw = useMemo(() => lines.map(line => line.text).join('\n'), [lines])
@@ -79,9 +84,13 @@ export function ReadBlock({
   // plain text while its language's grammar imported picks up highlighting. The
   // snapshot value is opaque; only its change across renders drives the memo.
   const loaded = useSyncExternalStore(subscribeGrammarLoaded, grammarLoadCount, grammarLoadCount)
-  const highlighted = useMemo(() => highlightLines(raw, lang), [raw, lang, loaded])
+  const highlighted = useMemo(
+    () => highlighting ? highlightLines(raw, lang) : undefined,
+    [highlighting, raw, lang, loaded],
+  )
   const [expanded, setExpanded] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [wrapped, setWrapped] = useState(false)
 
   const onCopy = useCallback(() => {
     if (copied) return
@@ -110,27 +119,21 @@ export function ReadBlock({
       </div>
     ))
 
+  const gutterDigits = lines.reduce((digits, line) => Math.max(digits, String(line.number).length), 3)
+  const gutterStyle = { '--dsl-read-gutter': `${gutterDigits}ch` } as CSSProperties
+
   const paired = lines.map((line, index): readonly [ReadBlockLine, readonly HighlightSpan[] | undefined] =>
     [line, highlighted?.[index]])
 
   return (
-    <div className={clsx(css.block, className)} data-read="">
-      <div className={css.banner}>
-        <div className={css.label}>{label ?? ''}</div>
-        <div className={css.action}>
-          {windowed && (
-            <span className={css.count}>{labels.window(lines.length, totalLines)}</span>
-          )}
-          <span className={css.lang}>{lang ?? ''}</span>
-          {/* Empty files omit Copy to avoid replacing the clipboard with an empty string. */}
-          {lines.length > 0 && (
-            <button type="button" className={css.copyButton} onClick={onCopy}>
-              {copied ? labels.copied : labels.copy}
-            </button>
-          )}
-        </div>
-      </div>
-      <div className={css.body}>
+    <div ref={rootRef} className={clsx(cardCss.card, css.block, className)} data-read="" data-code-wrap={wrapped} style={gutterStyle}>
+      <CodeToolbar
+        lang={lang} title={label} status={windowed ? labels.window(lines.length, totalLines) : undefined}
+        labels={labels} copyLabel={labels.copy} copiedLabel={labels.copied} copied={copied} wrapped={wrapped}
+        // Empty files must not replace the clipboard with empty text.
+        onCopy={lines.length > 0 ? onCopy : undefined} onWrap={() => { setWrapped(value => !value) }}
+      />
+      <div className={cardCss.body}>
         {rows(capped ? paired.slice(0, headLines) : paired)}
         {hidden > 0 && (
           <FoldToggle

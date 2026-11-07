@@ -1,46 +1,33 @@
+import type { ToolFileInjected } from '../file-menu.ts'
+import { toolFileInject } from '../file-menu.ts'
 import type { Context } from '@deepseek-ai/cordis'
-import { IconBrowseOutline16 } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { PropsLocale } from '@deepseek-ai/dsh-client-ui-slots'
 import type { ToolCallViewProps } from '../../contract/slots.ts'
-import { readCardModel } from '../models/read-card-model.ts'
-import { toolRowModel } from '../models/tool-call-model.ts'
-import { ToolRow } from '../components/ToolRow.tsx'
+import { readCallLine, readCardModel } from '../models/read-card-model.ts'
+import { readFamilyRow } from './read-family-row.tsx'
 import { CONVERSATION_NS as NS } from '../../locale.ts'
 
-type ReadRowProps = ToolCallViewProps & PropsLocale<'conversation'>
+type ReadRowProps = ToolCallViewProps & ToolFileInjected & PropsLocale<'conversation'>
 
 /**
- * Lets users expand a completed read result and open its reported path.
+ * Lets users expand a completed read result and open its reported path at the
+ * line the call started from.
  */
-export function ReadRow({ toolName, block, cwd, home, openFile, inspect, t }: ReadRowProps) {
-  const model = toolRowModel(toolName, block, cwd, home)
-  const read = readCardModel(block, cwd, home)
-  return (
-    <ToolRow
-      t={t}
-      variant={model.variant}
-      toolName={toolName}
-      icon={<IconBrowseOutline16 size={14} />}
-      title={t(model.titleKey)}
-      summary={model.summary}
-      body={null}
-      output={model.output}
-      errorSummary={model.errorSummary}
-      read={read}
-      state={model.state}
-      filePath={model.filePath}
-      onOpenFile={openFile}
-      inspect={inspect}
-    />
-  )
+export function ReadRow(props: ReadRowProps) {
+  const { block, cwd, home } = props
+  const { getTriggerProps } = props.useContextMenu()
+  return readFamilyRow(props, {
+    read: readCardModel(block, cwd, home),
+    filePathLine: readCallLine(block),
+  }, getTriggerProps)
 }
 
 /** Registers the read tool's conversation row. */
 export const readToolview = {
   name: 'read-toolview',
-  inject: ['slots'],
+  inject: ['slots', 'sessions'],
   apply(ctx: Context): void {
     ctx.slots.inject('tool.call.toolview', () =>
-      ctx.slots.register({ name: 'tool.call.toolview', key: 'read', locale: NS }, ReadRow))
+      ctx.slots.register({ name: 'tool.call.toolview', key: 'read', locale: NS, inject: toolFileInject(ctx) }, ReadRow))
   },
 }

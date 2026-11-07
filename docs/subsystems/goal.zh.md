@@ -2,7 +2,7 @@
 
 [English](goal.md) | 中文
 
-事件溯源目标服务及其策略消费方共享的类型。[目标领域 Agent Note](../../.agents/notes/implemented/feature/2026-07-19-persisted-same-session-goal-domain.zh.md) 负责记录持久化与激活决策；本页记录 [`packages/goal/goal/src/types.ts`](../../packages/goal/goal/src/types.ts) 中的确切字段和变体。
+事件溯源目标服务及其策略消费方共享的类型。[目标领域 参考](../../packages/goal/goal/README.zh.md) 负责记录持久化与激活决策；本页记录 [`packages/goal/goal/src/types.ts`](../../packages/goal/goal/src/types.ts) 中的确切字段和变体。
 
 ## 标识与生命周期
 
@@ -66,6 +66,25 @@ interface GoalView extends GoalSnapshot {
   readonly updatedAt: number
   /** Process-local continuation eligibility; never persisted. */
   readonly activation: GoalActivation
+}
+```
+
+服务还会在不改变持久状态的情况下发布进程本地 activation 边沿；客户端消费该事件获得实时状态。
+
+```ts type-equiv
+/** Live process-local activation update forwarded to UI clients. */
+interface GoalActivationChanged {
+  /** Session whose live goal activation changed. */
+  readonly sessionId: SessionId
+  /** Current exact activation, absent when no goal is current. */
+  readonly goal?: {
+    /** Exact current goal identity. */
+    readonly id: GoalId
+    /** Exact current goal revision. */
+    readonly revision: number
+    /** Current process-local continuation state. */
+    readonly activation: GoalActivation
+  }
 }
 ```
 
@@ -142,7 +161,7 @@ interface GoalChanged {
 
 ## 服务行为
 
-[`GoalService`](../../packages/goal/goal/src/index.ts) 解析创建默认值、从持久 `goal/change` 事件执行严格回放折叠、校验传入的 agent（智能体）是注册表中的确切活跃实例、以比较并设置方式执行变更，并发出 `goal/changed` 通知；监听器故障会被隔离。包 [README](../../packages/goal/goal/README.zh.md) 定义可调用 API 和面向模型的约定。
+[`GoalService`](../../packages/goal/goal/src/index.ts) 解析创建默认值、从可选注册的 `goal` 投影读取严格回放结果、校验传入的 agent（智能体）是注册表中的确切活跃实例、以比较并设置方式执行变更，并发出 `goal/changed` 通知；监听器故障会被隔离。注册表或 key 缺失时，第一次依赖它们的访问会失败。包 [README](../../packages/goal/goal/README.zh.md) 定义可调用 API 和面向模型的约定。
 
 <!-- BEGIN GENERATED cordis-surface (gen-cordis-catalog.ts) — do not edit between markers -->
 
@@ -165,7 +184,7 @@ Goal service (`ctx.goals`) backed exclusively by the owning session log.
  * @returns a fresh view or `undefined` when no goal is current.
  * @throws {@link GoalError} when the agent is not the registry's live instance.
  */
-get(agent: Agent): GoalView | undefined
+@Remote('get') get(agent: Agent): GoalView | undefined
 
 /**
  * Remove process-local continuation authority without changing durable goal
@@ -252,6 +271,23 @@ Source: [`packages/goal/goal/src/index.ts`](../../packages/goal/goal/src/index.t
 <a id="goal-events"></a>
 
 ### `goal/*` events
+
+<a id="goalactivation-changed--emit"></a>
+
+#### `goal/activation-changed` — emit
+
+Process-local goal activation changed for one session.
+
+```ts cordis-catalog
+/**
+ * Process-local goal activation changed for one session.
+ * @mode emit
+ * @param payload - session id and the exact current goal activation, or no goal after a clear.
+ */
+'goal/activation-changed'(payload: GoalActivationChanged): void
+```
+
+Source: [`packages/goal/goal/src/types.ts`](../../packages/goal/goal/src/types.ts)
 
 <a id="goalchanged--emit"></a>
 

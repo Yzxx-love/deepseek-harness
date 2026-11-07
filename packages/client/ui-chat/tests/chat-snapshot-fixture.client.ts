@@ -1,26 +1,44 @@
 import type {
-  AssistantChatData, AssistantMessageNode, ChatConversationViewNode, ChatSnapshot, ConversationNode,
-  ChatLocationNodeIndex, ChatNodeStore, CompactionSummaryNode, FinalAssistantChatData,
-  LegacyConversationSlice, PartialAssistant, RunningToolCall, ToolCallBlock, TurnNavigationItem,
+  AssistantChatData, AssistantMessageNode, ChatConversationViewNode, ChatNode, ChatSnapshot, ConversationNode,
+  ChatLocationNodeIndex, ChatNodeProcessSource, ChatNodeSource, ChatNodeStore,
+  ChatTurnProcessPresentation, CompactionSummaryNode, FinalAssistantChatData, LegacyConversationSlice,
+  PartialAssistant, RunningToolCall, ToolCallBlock, TurnNavigationItem,
 } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type {
-  ConversationLocationDataStore, ConversationTurnDataMap, TurnLocation,
+  ConversationLocationDataSource, ConversationLocationDataStore, ConversationTurnDataMap, TurnLocation,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
-import { deriveTurnMetrics } from '../src/client/contract/turn-metrics.ts'
+import { SessionSeq } from '@deepseek-ai/dsh-session/types'
+import type { TurnEndReason } from '@deepseek-ai/dsh-session/types'
+import type { TurnTokenUsage } from '../src/client/contract/chat-nodes.ts'
 import {
   sameTurnNavigationItem, turnNavigationItem,
 } from '../src/client/conversation-nodes/turn-navigation.ts'
 import { orderedVisibleChatNodes } from '../src/client/conversation-nodes/chat-snapshot-builder.ts'
+import { ChatTurnProcessProjector } from '../src/client/conversation-nodes/turn-process-presentation.ts'
 import { hasAssistantReplyContent } from '../src/client/contract/assistant-content.ts'
 import {
-  encodeTurnProcess, isSubagentDelegationTool, TURN_PROCESS_INDEPENDENT_KINDS,
+  isSubagentDelegationTool, sameTurnProcessSpec,
   type TurnProcessSpec,
 } from '../src/client/contract/turn-process.ts'
+import { isAtOrOutside, type ChatGroupTree } from '../src/client/contract/group-tree.ts'
 
 const EMPTY: readonly never[] = []
 
 function sameValues<T>(left: readonly T[], right: readonly T[]): boolean {
   return left.length === right.length && left.every((value, index) => value === right[index])
+}
+
+function cachedSource<Key, Source>(
+  sources: Map<Key, Source>,
+  key: Key,
+  create: () => Source,
+): Source {
+  let source = sources.get(key)
+  if (source === undefined) {
+    source = create()
+    sources.set(key, source)
+  }
+  return source
 }
 
 function sameFixtureLocation(
@@ -51,23 +69,77 @@ function nodeSource(node: ChatConversationViewNode): unknown {
   if (node.kind === 'tool-call') return (node.data as { readonly root: ToolCallBlock }).root
   if (node.kind === 'model-retry') return (node.data as { readonly current: unknown }).current
   if (node.kind === 'turn-tail') return (node.data as { readonly seq: number }).seq
-  if (node.kind === 'turn-process') {
-    const data = node.data as TurnProcessSpec
-    return encodeTurnProcess(data)
-  }
+  if (node.kind === 'turn-process') return node.data
   return node.data
 }
 
 function toolCallName(call: ToolCallBlock): string | null {
-  return 'name' in call ? call.name : call.call?.name ?? null
+  return 'kind' in call ? call.call?.name ?? null : call.name
+}
+
+class FixtureSource<Value> {
+  private readonly listeners = new Set<() => void>()
+  private published: Value
+
+  constructor(
+    private readonly read: () => Value,
+  ) {
+    this.published = read()
+  }
+
+  readonly getSnapshot = (): Value => this.read()
+
+  readonly subscribe = (listener: () => void): (() => void) => {
+    this.listeners.add(listener)
+    return () => { this.listeners.delete(listener) }
+  }
+
+  publish(): void {
+    const next = this.getSnapshot()
+    if (this.published === next) return
+    this.published = next
+    for (const listener of [...this.listeners]) listener()
+  }
 }
 
 class FixtureNodeStore implements ChatNodeStore {
   private byKey = new Map<string, ChatConversationViewNode>()
+  private readonly turnProcesses = new ChatTurnProcessProjector()
+  private readonly sources = new Map<string, FixtureSource<ChatConversationViewNode | undefined>>()
+  private readonly processSources = new Map<string, FixtureSource<ChatTurnProcessPresentation | undefined>>()
+  private readonly bottomSources = new Map<string, FixtureSource<boolean>>()
+  /** First Turn of the latest loaded exchange. */
+  bottomStart: number | undefined
+  private readonly dirtyKeys = new Set<string>()
+  private readonly dirtyProcessKeys = new Set<string>()
   private list: readonly ChatConversationViewNode[] = EMPTY
 
   get(key: string): ChatConversationViewNode | undefined {
     return this.byKey.get(key)
+  }
+
+  source(key: string): ChatNodeSource {
+    return cachedSource(this.sources, key, () => new FixtureSource(() => this.get(key)))
+  }
+
+  bottomSource(key: string): ReturnType<ChatNodeStore['bottomSource']> {
+    return cachedSource(this.bottomSources, key, () => new FixtureSource(() => {
+      const location = this.get(key)?.location
+      return this.bottomStart !== undefined && (location?.kind === 'turn' || location?.kind === 'step')
+        && location.turn.turn >= this.bottomStart
+    }))
+  }
+
+  turnDataSource(): never {
+    throw new Error('turn collections require the real ChatSnapshotBuilder')
+  }
+
+  processSource(key: string): ChatNodeProcessSource {
+    return cachedSource(this.processSources, key, () => new FixtureSource(() => this.process(key)))
+  }
+
+  process(key: string): ChatTurnProcessPresentation | undefined {
+    return this.turnProcesses.get(this.get(key) as ChatNode | undefined)
   }
 
   values(): readonly ChatConversationViewNode[] {
@@ -75,22 +147,47 @@ class FixtureNodeStore implements ChatNodeStore {
   }
 
   replace(candidates: readonly ChatConversationViewNode[]): void {
+    const previous = this.byKey
     const next = new Map<string, ChatConversationViewNode>()
     const list = candidates.map((candidate) => {
-      const previous = this.byKey.get(candidate.key)
-      const node = previous !== undefined
-        && previous.kind === candidate.kind
-        && previous.anchorSeq === candidate.anchorSeq
-        && sameFixtureLocation(previous.location, candidate.location)
-        && previous.visibility === candidate.visibility
-        && nodeSource(previous) === nodeSource(candidate)
-        ? previous
+      const existing = previous.get(candidate.key)
+      const node = existing !== undefined
+        && existing.kind === candidate.kind
+        && existing.anchorSeq === candidate.anchorSeq
+        && sameFixtureLocation(existing.location, candidate.location)
+        && existing.visibility === candidate.visibility
+        && nodeSource(existing) === nodeSource(candidate)
+        ? existing
         : candidate
       next.set(node.key, node)
       return node
     })
     this.byKey = next
     this.list = sameValues(this.list, list) ? this.list : list
+    const keys = new Set([...previous.keys(), ...next.keys()])
+    for (const key of keys) {
+      if (previous.get(key) !== next.get(key)) {
+        this.dirtyKeys.add(key)
+        this.dirtyProcessKeys.add(key)
+      }
+    }
+  }
+
+  replaceProcesses(order: readonly string[], locations: ChatLocationNodeIndex): void {
+    const changed = this.turnProcesses.replace(order, locations, this)
+    for (const turn of changed) {
+      for (const key of locations.getTurn(turn)) this.dirtyProcessKeys.add(key)
+    }
+  }
+
+  publish(): void {
+    const dirty = [...this.dirtyKeys]
+    const dirtyProcesses = [...this.dirtyProcessKeys]
+    this.dirtyKeys.clear()
+    this.dirtyProcessKeys.clear()
+    for (const key of dirty) this.sources.get(key)?.publish()
+    for (const key of dirtyProcesses) this.processSources.get(key)?.publish()
+    for (const source of this.bottomSources.values()) source.publish()
   }
 }
 
@@ -117,6 +214,8 @@ class FixtureLocationIndex implements ChatLocationNodeIndex {
 
 class FixtureTurnDataStore implements ConversationLocationDataStore<ConversationTurnDataMap> {
   private readonly values = new Map<string, unknown>()
+  private readonly sources = new Map<string, FixtureSource<unknown>>()
+  private readonly dirtyKeys = new Set<string>()
 
   get<Key extends Extract<keyof ConversationTurnDataMap, string>>(
     key: Key,
@@ -124,11 +223,39 @@ class FixtureTurnDataStore implements ConversationLocationDataStore<Conversation
     return this.values.get(key) as Readonly<ConversationTurnDataMap[Key]> | undefined
   }
 
+  source<Key extends Extract<keyof ConversationTurnDataMap, string>>(
+    key: Key,
+  ): ConversationLocationDataSource<Readonly<ConversationTurnDataMap[Key]> | undefined> {
+    const source = cachedSource(this.sources, key, () => new FixtureSource(() => this.values.get(key)))
+    return source as ConversationLocationDataSource<Readonly<ConversationTurnDataMap[Key]> | undefined>
+  }
+
   set<Key extends Extract<keyof ConversationTurnDataMap, string>>(
     key: Key,
     value: ConversationTurnDataMap[Key],
   ): void {
+    if (this.values.get(key) === value) return
     this.values.set(key, value)
+    this.dirtyKeys.add(key)
+  }
+
+  publish(): void {
+    const dirty = [...this.dirtyKeys]
+    this.dirtyKeys.clear()
+    for (const key of dirty) this.sources.get(key)?.publish()
+  }
+}
+
+/** Positions the production Definitions declare for the legacy kinds this fixture projects. */
+function fixtureGroupTree(kind: string, inTurn: boolean): ChatGroupTree | undefined {
+  switch (kind) {
+    // A fixture user message inside a Turn stands for its opening human input.
+    case 'user': return inTurn ? 'exchange' : 'input'
+    case 'steering': return 'input'
+    case 'turn-error':
+    case 'turn-max-tokens': return 'turn'
+    case 'model-retry': return 'process'
+    default: return undefined
   }
 }
 
@@ -159,6 +286,7 @@ function settledNode(
       ? { kind: 'session' as const }
       : { kind: 'turn' as const, turn },
     visibility: 'visible' as const,
+    groupTree: fixtureGroupTree(node.kind, turn !== undefined),
   }
   switch (node.kind) {
     case 'assistant':
@@ -178,7 +306,12 @@ export function chatSnapshotFixture(input: {
   readonly partial?: PartialAssistant | null
   readonly runningCalls?: readonly RunningToolCall[]
   readonly turnTimings?: LegacyConversationSlice['turnTimings']
+  /** Recorded ends exist without starts; missing end times follow the fixture's seq × 1000 convention. */
   readonly turnEnds?: LegacyConversationSlice['turnEnds']
+  /** End reasons by turn; absent turns end `completed`. */
+  readonly turnEndReasons?: ReadonlyMap<number, TurnEndReason>
+  /** Per-turn usage buckets; production derives these from session events. */
+  readonly turnUsages?: ReadonlyMap<number, TurnTokenUsage> | undefined
 } = {}, previous?: ChatSnapshot): ChatSnapshot {
   const legacy: LegacyConversationSlice = {
     nodes: input.nodes ?? EMPTY,
@@ -204,11 +337,12 @@ export function chatSnapshotFixture(input: {
     turns.set(turn, {
       turn,
       start: timing === undefined ? undefined : {
-        type: 'turn/start', seq: Math.max(0, (endSeq ?? 1) - 1), time: timing.startTime, turn,
-      } as never,
-      end: timing?.endTime === undefined || endSeq === undefined ? undefined : {
-        type: 'turn/end', seq: endSeq, time: timing.endTime, turn, reason: 'completed',
-      } as never,
+        type: 'turn/start', seq: SessionSeq(Math.max(0, (endSeq ?? 1) - 1)), time: timing.startTime, data: { turn },
+      },
+      end: endSeq === undefined ? undefined : {
+        type: 'turn/end', seq: SessionSeq(endSeq), time: timing?.endTime ?? endSeq * 1000,
+        data: { turn, reason: input.turnEndReasons?.get(turn) ?? { kind: 'completed' } },
+      },
       status: endSeq === undefined ? 'open' : 'closed',
       steps: EMPTY,
       data,
@@ -304,14 +438,16 @@ export function chatSnapshotFixture(input: {
     const controlAnchor = inTurn.find(candidate => candidate.kind === 'assistant-step'
       || candidate.kind === 'tool-call'
       || candidate.kind === 'model-retry')
-    if (controlAnchor === undefined) continue
-    const processStart = inTurn.find(candidate => !TURN_PROCESS_INDEPENDENT_KINDS.has(candidate.kind))
+    const turn = turns.get(turnNumber)
+    const controlAnchorSeq = controlAnchor?.anchorSeq ?? turn?.start?.seq
+    if (controlAnchorSeq === undefined) continue
+    const processStart = inTurn.find(candidate => !isAtOrOutside(candidate, 'turn'))
       ?? controlAnchor
     const inlineReasoning = answer?.blocks.some(block => block.kind === 'reasoning' && block.text.trim() !== '') === true
-    const spec: TurnProcessSpec = {
+    const candidate: TurnProcessSpec = {
       turn: turnNumber,
-      controlAnchorSeq: controlAnchor.anchorSeq,
-      processStartSeq: processStart.anchorSeq,
+      controlAnchorSeq,
+      processStartSeq: processStart?.anchorSeq ?? controlAnchorSeq,
       answerAnchorSeq: answer?.finalNode.seq ?? null,
       answerStep: answer?.step ?? null,
       inlineReasoning: answer !== undefined && inlineReasoning,
@@ -328,8 +464,11 @@ export function chatSnapshotFixture(input: {
         return name !== null && isSubagentDelegationTool(name)
       }).length,
     }
-    dataStore.set('turn-process', encodeTurnProcess(spec))
-    const turn = turns.get(turnNumber)
+    const previousSpec = dataStore.get('turn-process')
+    const spec = previousSpec !== undefined && sameTurnProcessSpec(previousSpec, candidate)
+      ? previousSpec
+      : candidate
+    dataStore.set('turn-process', spec)
     if (turn !== undefined) {
       nodes.push({
         key: `fixture:turn-process:${String(turnNumber)}`,
@@ -339,6 +478,7 @@ export function chatSnapshotFixture(input: {
         anchorSeq: spec.controlAnchorSeq - 0.1,
         location: { kind: 'turn', turn },
         visibility: 'visible',
+        groupTree: 'turn',
         data: spec,
       })
     }
@@ -359,7 +499,7 @@ export function chatSnapshotFixture(input: {
       return (location.kind === 'turn' || location.kind === 'step')
         && location.turn.turn === turnNumber
     })
-    const metrics = deriveTurnMetrics(legacy.nodes).get(turnNumber)
+    const tokenUsage = input.turnUsages?.get(turnNumber)
     const tailData = {
       turn: turnNumber,
       seq: endSeq,
@@ -368,8 +508,7 @@ export function chatSnapshotFixture(input: {
       branchUnavailable: closing === null
         || preceding?.kind !== 'assistant-step'
         || (preceding.data as ReturnType<typeof assistantData>).finalNode.seq !== closing.finalNode.seq,
-      ...metrics?.ttftMs === undefined ? {} : { ttftMs: metrics.ttftMs },
-      ...metrics?.tokensPerSecond === undefined ? {} : { tokensPerSecond: metrics.tokensPerSecond },
+      ...tokenUsage === undefined ? {} : { tokenUsage },
     }
     dataStore.set('turn-tail', tailData)
     nodes.push({
@@ -380,6 +519,7 @@ export function chatSnapshotFixture(input: {
       anchorSeq: endSeq,
       location: { kind: 'turn', turn },
       visibility: 'visible',
+      groupTree: 'turn',
       data: tailData,
     })
   }
@@ -402,11 +542,17 @@ export function chatSnapshotFixture(input: {
     ? previous.locations
     : new FixtureLocationIndex()
   locations.replace(byTurn)
+  store.replaceProcesses(order, locations)
   const timeline = previous !== undefined
     && previous.legacy.turnTimings === legacy.turnTimings
     && previous.legacy.turnEnds === legacy.turnEnds
     ? previous.timeline
     : { turnOrder: [...turns.keys()], turns }
+  const openingTurns = store.values().flatMap((node) => {
+    const location = node.location
+    return isAtOrOutside(node, 'exchange') && (location.kind === 'turn' || location.kind === 'step') ? [location.turn.turn] : []
+  })
+  store.bottomStart = openingTurns.length === 0 ? timeline.turnOrder[0] : Math.max(...openingTurns)
   const derived = timeline.turnOrder
     .map(turn => turnNavigationItem(turn, locations, store))
     .filter((item): item is TurnNavigationItem => item !== undefined)
@@ -415,6 +561,8 @@ export function chatSnapshotFixture(input: {
     && derived.every((item, index) => sameTurnNavigationItem(kept[index], item))
     ? kept
     : derived
+  for (const data of turnData.values()) data.publish()
+  store.publish()
   return {
     order,
     nodes: store,

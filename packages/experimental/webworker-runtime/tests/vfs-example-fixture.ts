@@ -1,11 +1,23 @@
 /** Deterministic source for the filesystem tree bundled into the WebWorker preview. */
 
 import { fileURLToPath } from 'node:url'
-import { SessionId, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
 import {
-  eventLines, projectKey, toHeaderLine,
+  SESSION_FORMAT_VERSION,
+  SessionId,
+  SessionLogOffset,
+  SessionSeq,
+  type SessionEvent,
+  type SessionHeader,
+  type SessionLogOffset as SessionLogOffsetType,
+  type SessionSeq as SessionSeqType,
+} from '@deepseek-ai/dsh-session'
+import {
+  eventLines, generationLogFilename, projectKey, toHeaderLine,
 } from '@deepseek-ai/dsh-session-persistence-jsonl/src/format.ts'
-import { snapshotSubagentDescriptor } from '@deepseek-ai/dsh-subagent'
+import { projectionCacheDomainSpec } from '@deepseek-ai/dsh-session-projection-cache'
+import { scheduleDomain } from '@deepseek-ai/dsh-schedule'
+import { snapshotSubagentDescriptor, SUBAGENT_DESCRIPTOR_VERSION } from '@deepseek-ai/dsh-subagent'
+import { SUBAGENT_CATALOG_VERSION } from '@deepseek-ai/dsh-subagent/src/catalog.ts'
 
 /** Root copied by the preview image's repository adapter. */
 export const VFS_EXAMPLE_ROOT = fileURLToPath(new URL('./fixtures/vfs-example', import.meta.url))
@@ -15,16 +27,35 @@ export const VFS_EXAMPLE_SESSION_IDS = {
   main: SessionId('preview-showcase'),
   oneShot: SessionId('preview-architecture-review'),
   continuable: SessionId('preview-follow-up-builder'),
+  spacing: SessionId('preview-turn-spacing'),
 } as const
 
 /** Stable title rendered in the root Session list. */
 export const VFS_EXAMPLE_TITLE = 'WebWorker Preview Showcase'
+
+/** Title of the multi-Turn spacing sample in the root Session list. */
+export const VFS_EXAMPLE_SPACING_TITLE = 'Turn spacing sample'
 
 /** Oldest prompt, intentionally outside the first 50-message history page. */
 export const VFS_EXAMPLE_OLDEST_MESSAGE = 'History checkpoint 01: verify deterministic preview state.'
 
 /** Settled tail marker used by browser acceptance and the demonstration GIF. */
 export const VFS_EXAMPLE_TAIL_MESSAGE = 'Preview tour complete'
+
+/** Non-empty reasoning bodies surrounded by empty and whitespace-only fixture blocks. */
+export const VFS_EXAMPLE_REASONING = [
+  'I will inspect the deterministic workspace and collect each preview surface.',
+  'Check the Chat presentation\n\nI will inspect the wrapped command, its first-line status, and the parent-path file link.',
+] as const
+
+/** Authored long command and a second line for wrapping and status-dot acceptance. */
+export const VFS_EXAMPLE_WRAPPED_COMMAND = `printf 'preview command fixture\\n' # ${'wrapped-argument-'.repeat(28)}\nprintf 'wrap complete\\n'\n`
+
+/** Durable task ids for the Host Schedule rows seeded into the preview's `DSH_HOME`. */
+export const VFS_EXAMPLE_SCHEDULE_IDS = {
+  daily: 'preview-daily-digest',
+  once: 'preview-release-window',
+} as const
 
 const WORKSPACE = '/dsh/workspace'
 const CREATED_AT = 1_787_472_000_000
@@ -71,7 +102,7 @@ interface EventDraft {
   readonly type: string
   readonly data: unknown
   readonly surfaceOp?: 'append'
-  readonly sourceEventSeqs?: number[]
+  readonly ignorable?: true
 }
 
 class EventLog {
@@ -83,8 +114,8 @@ class EventLog {
     this.nextTime = Math.max(time, (this.events.at(-1)?.time ?? time - 1) + 1)
   }
 
-  add(draft: EventDraft): number {
-    const seq = this.events.length
+  add(draft: EventDraft): SessionSeqType {
+    const seq = SessionSeq(this.events.length)
     this.events.push({ ...draft, seq, time: this.nextTime++ } as unknown as SessionEvent)
     return seq
   }
@@ -103,6 +134,38 @@ function userMessage(id: string, text: string): EventDraft {
   }
 }
 
+function assistantStream(content: readonly unknown[]): unknown[] {
+  const stream: unknown[] = []
+  let toolCalls = false
+  for (const [index, value] of content.entries()) {
+    const block = value as Record<string, unknown>
+    stream.push({ type: 'chunk', time: 0, chunk: { type: 'block-start', index, blockType: block.type } })
+    if (block.type === 'text') {
+      stream.push({ type: 'text-chunks', time0: 0, index, dt: [], texts: [block.text] })
+    } else if (block.type === 'reasoning') {
+      stream.push({ type: 'reasoning-chunks', time0: 0, index, dt: [], texts: [block.text] })
+    } else if (block.type === 'tool-call') {
+      toolCalls = true
+      stream.push({
+        type: 'tool-call-chunks',
+        time0: 0,
+        index,
+        dt: [],
+        id: block.id,
+        name: block.name,
+        args: [block.arguments],
+      })
+    }
+    stream.push({ type: 'chunk', time: 0, chunk: { type: 'block-end', index, block } })
+  }
+  stream.push({
+    type: 'chunk',
+    time: 0,
+    chunk: { type: 'finish', reason: { kind: toolCalls ? 'tool-calls' : 'stop' } },
+  })
+  return stream
+}
+
 function assistantMessage(id: string, turn: number, step: number, content: unknown[]): EventDraft {
   return {
     type: 'assistant/message',
@@ -115,8 +178,8 @@ function assistantMessage(id: string, turn: number, step: number, content: unkno
         content,
         source: { kind: 'model', provider: 'preview-fixture', model: 'deterministic' },
       },
+      stream: assistantStream(content),
     },
-    sourceEventSeqs: [],
     surfaceOp: 'append',
   }
 }
@@ -137,6 +200,12 @@ function readResult(): { text: string; meta: unknown } {
     text: `<path>PREVIEW.md</path>\n<type>file</type>\n<content>\n${lines.map(line => `${String(line.number)}: ${line.text}`).join('\n')}\n\n(End of file - total ${String(lines.length)} lines)\n</content>`,
     meta: { path: 'PREVIEW.md', offset: 1, lines, totalLines: lines.length, lang: 'md' },
   }
+}
+
+/** Render the workspace task file the way a `read` result shows it. */
+function tasksReadResult(): string {
+  const lines = TASKS.trimEnd().split('\n')
+  return `<path>data/tasks.json</path>\n<type>file</type>\n<content>\n${lines.map((text, index) => `${String(index + 1)}: ${text}`).join('\n')}\n\n(End of file - total ${String(lines.length)} lines)\n</content>`
 }
 
 function galleryCalls(): GalleryCall[] {
@@ -161,6 +230,12 @@ function galleryCalls(): GalleryCall[] {
       name: 'bash',
       args: { command: "printf 'preview ready\\n'", description: 'Print the preview readiness marker' },
       result: 'preview ready\n',
+    },
+    {
+      id: 'preview-wrapped-bash',
+      name: 'bash',
+      args: { command: VFS_EXAMPLE_WRAPPED_COMMAND, description: 'Show wrapped command and first-line status' },
+      result: 'preview command fixture\nwrap complete\n[exit code: 0]',
     },
     {
       id: 'preview-glob',
@@ -264,10 +339,13 @@ function addClosedTextTurn(log: EventLog, turn: number): void {
   log.add({ type: 'turn/end', data: { turn, reason: { kind: 'completed' } } })
 }
 
-function mainLog(): { readonly events: SessionEvent[]; readonly forkSeedLength: number } {
+function mainLog(): {
+  readonly events: SessionEvent[]
+  readonly forkSeedLength: SessionLogOffsetType
+} {
   const log = new EventLog(CREATED_AT)
   for (let turn = 1; turn <= HISTORICAL_TURNS; turn++) addClosedTextTurn(log, turn)
-  const forkSeedLength = log.events.length
+  const forkSeedLength = SessionLogOffset(log.events.length)
   const turn = HISTORICAL_TURNS + 1
   const calls = galleryCalls()
 
@@ -275,7 +353,8 @@ function mainLog(): { readonly events: SessionEvent[]; readonly forkSeedLength: 
   log.add(userMessage('preview-gallery-user', 'Show the seeded workspace, tool cards, subagents, and pagination in one tour.'))
   log.add({ type: 'step/start', data: { turn, step: 1 } })
   log.add(assistantMessage('preview-gallery-tools', turn, 1, [
-    { type: 'reasoning', text: 'I will inspect the deterministic workspace and collect each preview surface.' },
+    ...['', ' \t\n', VFS_EXAMPLE_REASONING[0], '', VFS_EXAMPLE_REASONING[1], '\n  ']
+      .map(text => ({ type: 'reasoning', text })),
     ...calls.map(call => ({ type: 'tool-call', id: call.id, name: call.name, arguments: JSON.stringify(call.args) })),
   ]))
   for (const call of calls) {
@@ -291,14 +370,11 @@ function mainLog(): { readonly events: SessionEvent[]; readonly forkSeedLength: 
         step: 1,
         message: {
           id: `${call.id}-result`,
-          role: 'user',
-          content: [{
-            type: 'tool-result',
-            toolCallId: call.id,
-            content: [{ type: 'text', text: call.result }],
-            isError: call.error !== undefined,
-          }],
+          role: 'tool',
+          toolCallId: call.id,
           source: { kind: 'tool', callId: call.id },
+          content: [{ type: 'text', text: call.result }],
+          isError: call.error !== undefined,
         },
         ...call.meta === undefined ? {} : { meta: call.meta },
         ...call.error === undefined ? {} : { error: call.error },
@@ -306,11 +382,17 @@ function mainLog(): { readonly events: SessionEvent[]; readonly forkSeedLength: 
       surfaceOp: 'append',
     })
   }
+  for (const child of [
+    { childId: VFS_EXAMPLE_SESSION_IDS.oneShot, childCreatedAt: CREATED_AT + 100_000, mode: 'one-shot', label: 'Review preview architecture' },
+    { childId: VFS_EXAMPLE_SESSION_IDS.continuable, childCreatedAt: CREATED_AT + 200_000, mode: 'continuable', label: 'Continue preview verification' },
+  ] as const) {
+    log.add({ type: 'subagent/catalog', data: { version: SUBAGENT_CATALOG_VERSION, ...child } })
+  }
   log.add({ type: 'step/end', data: { turn, step: 1 } })
   log.add({ type: 'step/start', data: { turn, step: 2 } })
   log.add(assistantMessage('preview-gallery-final', turn, 2, [{
     type: 'text',
-    text: `## ${VFS_EXAMPLE_TAIL_MESSAGE}\n\nThe workspace, specialized tool cards, two subagent histories, and an earlier history page are ready to inspect.`,
+    text: `## ${VFS_EXAMPLE_TAIL_MESSAGE}\n\nThe workspace, specialized tool cards, two subagent histories, and an earlier history page are ready to inspect.\n\nThis is fixture-authored demonstration data, not a live model run. Open [Parent workspace guide:1–8](<../workspace/PREVIEW.md#L1-L8>) to inspect the same workspace file through a parent path.`,
   }]))
   log.add({ type: 'step/end', data: { turn, step: 2 } })
   log.add({ type: 'turn/end', data: { turn, reason: { kind: 'completed' } } })
@@ -319,15 +401,16 @@ function mainLog(): { readonly events: SessionEvent[]; readonly forkSeedLength: 
 
 function oneShotLog(seed: readonly SessionEvent[]): SessionEvent[] {
   const log = new EventLog(CREATED_AT + 100_000, seed)
-  log.add({ type: 'session/end-seed', data: {} })
+  log.add({ type: 'session/end-seed', data: { inherited: true } })
   const turn = HISTORICAL_TURNS + 1
   log.add({ type: 'turn/start', data: { turn } })
   log.add(userMessage('preview-review-user', 'Review whether the preview fixture is isolated from future WebFS data.'))
   log.add({
     type: 'subagent/descriptor',
-    data: snapshotSubagentDescriptor({
+    data: {
+      version: SUBAGENT_DESCRIPTOR_VERSION,
       mode: 'one-shot', provider: 'fork', label: 'Review preview architecture',
-    }),
+    },
   })
   log.add({ type: 'step/start', data: { turn, step: 1 } })
   log.add(assistantMessage('preview-review-assistant', turn, 1, [{
@@ -359,44 +442,281 @@ function continuableLog(): SessionEvent[] {
   return log.events
 }
 
+/** One step of the multi-Turn spacing sample: reasoning, tool calls, or a closing body. */
+interface SpacingStep {
+  /** Assistant message id. */
+  readonly id: string
+  /** Reasoning text shown in the step's Think row. */
+  readonly reasoning?: string
+  /** Tool calls issued in this step, each with its recorded result. */
+  readonly calls?: readonly GalleryCall[]
+  /** Closing Markdown body for a step without tool calls. */
+  readonly body?: string
+}
+
+function addSpacingTurn(
+  log: EventLog,
+  turn: number,
+  prompt: { readonly id: string; readonly text: string },
+  steps: readonly SpacingStep[],
+): void {
+  log.add({ type: 'turn/start', data: { turn } })
+  log.add(userMessage(prompt.id, prompt.text))
+  if (turn === 1) {
+    log.add({
+      type: 'session/title',
+      data: { title: VFS_EXAMPLE_SPACING_TITLE, messageSeqs: [], source: { kind: 'user' } },
+    })
+  }
+  for (const [index, step] of steps.entries()) {
+    const stepNumber = index + 1
+    log.add({ type: 'step/start', data: { turn, step: stepNumber } })
+    const content: unknown[] = []
+    if (step.reasoning !== undefined) content.push({ type: 'reasoning', text: step.reasoning })
+    for (const call of step.calls ?? []) {
+      content.push({ type: 'tool-call', id: call.id, name: call.name, arguments: JSON.stringify(call.args) })
+    }
+    if (step.body !== undefined) content.push({ type: 'text', text: step.body })
+    log.add(assistantMessage(step.id, turn, stepNumber, content))
+    for (const call of step.calls ?? []) {
+      log.add({
+        type: 'tool/call',
+        data: { turn, step: stepNumber, callId: call.id, name: call.name, arguments: JSON.stringify(call.args) },
+      })
+      log.add({
+        type: 'tool/result',
+        data: {
+          turn,
+          step: stepNumber,
+          message: {
+            id: `${call.id}-result`,
+            role: 'tool',
+            toolCallId: call.id,
+            source: { kind: 'tool', callId: call.id },
+            content: [{ type: 'text', text: call.result }],
+            isError: false,
+          },
+        },
+        surfaceOp: 'append',
+      })
+    }
+    log.add({ type: 'step/end', data: { turn, step: stepNumber } })
+  }
+  log.add({ type: 'turn/end', data: { turn, reason: { kind: 'completed' } } })
+}
+
+/**
+ * Three Turns with multi-step processes and multi-paragraph bodies, so the
+ * preview shows the tightened process-row gap beside the reply clearance.
+ */
+function spacingLog(): SessionEvent[] {
+  const log = new EventLog(CREATED_AT + 300_000)
+  addSpacingTurn(log, 1, {
+    id: 'preview-spacing-user-1',
+    text: 'Show how multiple Turns and their process steps sit on the tightened spacing.',
+  }, [
+    {
+      id: 'preview-spacing-1-tools',
+      reasoning: 'Read the workspace guide, then list the files this sample references.',
+      calls: [
+        { id: 'preview-spacing-read', name: 'read', args: { file_path: 'PREVIEW.md' }, result: readResult().text },
+        {
+          id: 'preview-spacing-glob', name: 'glob', args: { pattern: '**/*', path: '.' },
+          result: 'PREVIEW.md\ndata/tasks.json\nsrc/preview.ts',
+        },
+      ],
+    },
+    {
+      id: 'preview-spacing-1-command',
+      reasoning: 'Confirm the sample command result before writing the body.',
+      calls: [{
+        id: 'preview-spacing-bash', name: 'bash',
+        args: { command: "printf 'spacing sample 1\\n'", description: 'Print the first spacing sample marker' },
+        result: 'spacing sample 1\n',
+      }],
+    },
+    {
+      id: 'preview-spacing-1-body',
+      body: '## Turn 1 — setup\n\nThis Turn has three steps: two process steps and one closing body. Inside an expanded group the process rows use the tightened gap, while this body keeps the reply clearance from the rows above.\n\nExpand the Turn control above to compare the tightened process rhythm with the reply rhythm.',
+    },
+  ])
+  addSpacingTurn(log, 2, {
+    id: 'preview-spacing-user-2',
+    text: 'Continue the sample with a second body and a shorter process.',
+  }, [
+    {
+      id: 'preview-spacing-2-tools',
+      reasoning: 'Search the sample workspace for the spacing note.',
+      calls: [{
+        id: 'preview-spacing-grep', name: 'grep',
+        args: { pattern: 'preview', path: '.', include: '*.{md,ts,json}' },
+        result: 'PREVIEW.md:3:This deterministic workspace is bundled with the browser-only preview.\nsrc/preview.ts:1:export const previewStatus = \'ready\'',
+      }],
+    },
+    {
+      id: 'preview-spacing-2-body',
+      body: '## Turn 2 — follow-up\n\nA shorter Turn still separates its process group from this body by the reply clearance, so consecutive Turns stay readable.\n\nThe gap between the previous Turn and this user message is the ordinary flow gap.',
+    },
+  ])
+  addSpacingTurn(log, 3, {
+    id: 'preview-spacing-user-3',
+    text: 'Finish the sample with one more multi-step Turn.',
+  }, [
+    {
+      id: 'preview-spacing-3-tools',
+      reasoning: 'Read the task list and print the final sample marker.',
+      calls: [
+        {
+          id: 'preview-spacing-tasks', name: 'read', args: { file_path: 'data/tasks.json' },
+          result: tasksReadResult(),
+        },
+        {
+          id: 'preview-spacing-final-bash', name: 'bash',
+          args: { command: "printf 'spacing sample complete\\n'", description: 'Print the final spacing sample marker' },
+          result: 'spacing sample complete\n',
+        },
+      ],
+    },
+    {
+      id: 'preview-spacing-3-body',
+      body: '## Turn 3 — closing\n\nThe last Turn has a two-step shape: one process step and one closing body.\n\nSpacing sample complete: compare these process rows with the reply clearance around each Turn body.',
+    },
+  ])
+  return log.events
+}
+
 function header(
   id: SessionHeader['id'],
   createdAt: number,
-  child?: { readonly parentSession: SessionHeader['id']; readonly mode: 'one-shot' | 'continuable'; readonly seedLength?: number },
-): SessionHeader {
+  child?: {
+    readonly parentSession: SessionHeader['id']
+    readonly mode: 'one-shot' | 'continuable'
+    readonly seedLength?: SessionLogOffsetType
+  },
+): { readonly meta: SessionHeader; readonly inheritedEventCount: SessionLogOffsetType } {
+  const inheritedEventCount = child?.seedLength ?? SessionLogOffset(0)
   return {
-    version: 0,
-    id,
-    createdAt,
-    cwd: WORKSPACE,
-    delegationDepth: child === undefined ? 0 : 1,
-    agentPreset: 'standard',
-    ...child === undefined ? {} : {
-      parentSession: child.parentSession,
-      origin: 'subagent' as const,
-      ...child.seedLength === undefined ? {} : { seedLength: child.seedLength },
+    meta: {
+      version: SESSION_FORMAT_VERSION,
+      id,
+      createdAt,
+      cwd: WORKSPACE,
+      isSeeded: child?.seedLength !== undefined,
+      delegationDepth: child === undefined ? 0 : 1,
+      agentPreset: 'standard',
+      ...child === undefined ? {} : {
+        parentSession: child.parentSession,
+        origin: 'subagent' as const,
+      },
+    },
+    inheritedEventCount,
+  }
+}
+
+function renderLog(
+  storage: { readonly meta: SessionHeader; readonly inheritedEventCount: SessionLogOffsetType },
+  events: readonly SessionEvent[],
+): string {
+  return `${JSON.stringify(toHeaderLine(storage.meta, storage.inheritedEventCount))}\n${eventLines(events)}\n`
+}
+
+/**
+ * Host Schedule task rows the preview's `DSH_HOME` carries, keyed by durable
+ * task id.
+ *
+ * The schedule domain opens these per-record documents at Host startup and
+ * rejects the complete domain on any malformed row, so the fixture spec decodes
+ * every stored task through the production schema. Targets sit in 2099:
+ * the Session row mark, the header clock entry, and the tasks page render them
+ * as scheduled, while the timer clamp (`MAX_TIMER_DELAY_MS`) keeps a preview
+ * session from dispatching them. The daily row carries a saved delivery so the
+ * detail's records tab renders retained content.
+ * @returns Task rows for the schedule domain's `tasks` table.
+ */
+function scheduleTasks(): Readonly<Record<string, unknown>> {
+  const sessionId = VFS_EXAMPLE_SESSION_IDS.main
+  const dailyPrompt = 'Summarize the preview workspace changes and their verification status.'
+  const dailyReceipt = {
+    scheduledAt: '2098-12-31T01:00:00.000Z',
+    deliveredAt: '2098-12-31T01:00:01.000Z',
+    messageId: 'preview-daily-digest-receipt',
+    targetSessionId: sessionId,
+  }
+  const common = {
+    target: { kind: 'session', sessionId },
+    involvedSessionIds: [sessionId],
+    status: 'active',
+    createdAt: new Date(CREATED_AT).toISOString(),
+    updatedAt: new Date(CREATED_AT).toISOString(),
+  }
+  return {
+    [VFS_EXAMPLE_SCHEDULE_IDS.daily]: {
+      ...common,
+      record: {
+        kind: 'rrule',
+        id: VFS_EXAMPLE_SCHEDULE_IDS.daily,
+        title: 'Daily preview digest',
+        prompt: dailyPrompt,
+        rrule: 'DTSTART;TZID=Asia/Shanghai:20990101T090000\nRRULE:FREQ=DAILY',
+        scheduledAt: '2099-01-01T01:00:00.000Z',
+      },
+      deliveryHistory: {
+        earlierRecordsUnavailable: false,
+        earlierRecordsPruned: false,
+        records: [{ ...dailyReceipt, prompt: dailyPrompt }],
+      },
+      lastDelivery: dailyReceipt,
+    },
+    [VFS_EXAMPLE_SCHEDULE_IDS.once]: {
+      ...common,
+      record: {
+        kind: 'rrule',
+        id: VFS_EXAMPLE_SCHEDULE_IDS.once,
+        title: 'Preview release window',
+        prompt: 'Remind the preview owner that the release window opens.',
+        rrule: 'DTSTART:20990102T000000Z\nRRULE:FREQ=DAILY;COUNT=1',
+        scheduledAt: '2099-01-02T00:00:00.000Z',
+      },
+      deliveryHistory: { records: [], earlierRecordsUnavailable: false, earlierRecordsPruned: false },
     },
   }
 }
 
-function renderLog(meta: SessionHeader, events: readonly SessionEvent[]): string {
-  return `${JSON.stringify(toHeaderLine(meta))}\n${eventLines(events, true)}\n`
-}
-
-/** Build every committed fixture file as repository-relative UTF-8 text. */
+/** Build current-generation fixture files as fixture-relative UTF-8 text; committed predecessors remain untouched. */
 export function buildVfsExampleFiles(): ReadonlyMap<string, string> {
   const main = mainLog()
+  const spacing = spacingLog()
   const project = projectKey(WORKSPACE)
-  const sessionPath = (id: string): string => `home/sessions/${project}/${id}/session.jsonl`
+  const sessionPath = (id: string): string =>
+    `home/sessions/${project}/${id}/${generationLogFilename(SESSION_FORMAT_VERSION, 'none')}`
+  const scheduleFile = `home/storages/${scheduleDomain.name}.json`
   const projectionCache = `${JSON.stringify({
-    unit: { name: 'session_projcache', version: 3 },
+    unit: { name: 'session_projcache', version: projectionCacheDomainSpec.version },
     global: null,
     tables: {
       sessions: {
         [VFS_EXAMPLE_SESSION_IDS.main]: {
-          identity: { createdAt: CREATED_AT, cwd: WORKSPACE },
+          identity: {
+            formatVersion: SESSION_FORMAT_VERSION,
+            createdAt: CREATED_AT,
+            cwd: WORKSPACE,
+            isSeeded: false,
+            inheritedEventCount: 0,
+          },
           rows: {
             title: { ver: 1, seq: main.events.at(-1)?.seq ?? -1, val: VFS_EXAMPLE_TITLE },
+          },
+        },
+        [VFS_EXAMPLE_SESSION_IDS.spacing]: {
+          identity: {
+            formatVersion: SESSION_FORMAT_VERSION,
+            createdAt: CREATED_AT + 300_000,
+            cwd: WORKSPACE,
+            isSeeded: false,
+            inheritedEventCount: 0,
+          },
+          rows: {
+            title: { ver: 1, seq: spacing.at(-1)?.seq ?? -1, val: VFS_EXAMPLE_SPACING_TITLE },
           },
         },
       },
@@ -411,6 +731,10 @@ export function buildVfsExampleFiles(): ReadonlyMap<string, string> {
     [sessionPath(VFS_EXAMPLE_SESSION_IDS.main), renderLog(
       header(VFS_EXAMPLE_SESSION_IDS.main, CREATED_AT),
       main.events,
+    )],
+    [sessionPath(VFS_EXAMPLE_SESSION_IDS.spacing), renderLog(
+      header(VFS_EXAMPLE_SESSION_IDS.spacing, CREATED_AT + 300_000),
+      spacing,
     )],
     [sessionPath(VFS_EXAMPLE_SESSION_IDS.oneShot), renderLog(
       header(VFS_EXAMPLE_SESSION_IDS.oneShot, CREATED_AT + 100_000, {
@@ -427,5 +751,7 @@ export function buildVfsExampleFiles(): ReadonlyMap<string, string> {
       }),
       continuableLog(),
     )],
+    [scheduleFile, `${JSON.stringify({ unit: { name: scheduleDomain.name, version: scheduleDomain.version },
+      global: null, tables: { tasks: scheduleTasks() } }, null, 2)}\n`],
   ])
 }

@@ -1,15 +1,15 @@
 ---
-description: "The schedule group map: session-local durable reminders over the session log, for users and maintainers navigating the group."
+description: "The schedule package group: Host-owned scheduled tasks, reminders, and task management."
 kind: "package-group"
 ---
 
-# schedule/ — Session-local reminders
+# schedule/ — Host-owned scheduled tasks
 
 English | [中文](README.zh.md)
 
 ## Summary
 
-The schedule group provides session-local reminders for a running conversation: ask the agent to remind you later, at an absolute time, or on a fixed interval, and each reminder arrives as an ordinary message in the same conversation when it comes due. It contains one package with three tools — create, list, and cancel — and no UI or service interface of its own. Reminders survive restarts but stay inside the session: there is no email, SMS, or push notification. This page maps the group; the package README owns the per-package contract.
+Create RFC 5545 recurring tasks that deliver to an existing Session or to a new one, and keep them across Host restarts. Inspect active, paused, and ended tasks without opening their target Sessions. An Agent uses the Schedule tools, and a user uses the sidebar Automation tasks page, to create, edit, pause, resume, and delete tasks; the Automation tasks page can also run a task now. Due tasks arrive as ordinary follow-up messages in their target Session, not email, SMS, or push notifications.
 
 ## Table of Contents
 
@@ -22,18 +22,22 @@ The schedule group provides session-local reminders for a running conversation: 
 <a id="packages"></a>
 ## Packages
 
-| Package | Role | ctx key |
-|---|---|---|
-| [`schedule/`](schedule/README.md) | Session-local reminders: schedule a one-time or fixed-interval reminder, list what is pending, and cancel one; due reminders arrive as conversation messages | — (tools only, in the exact agent scope) |
+Choose this package for persistent scheduled task management.
+
+| Package | Role |
+|---|---|
+| [`schedule/`](schedule/README.md) | Host-owned task persistence, scheduling, delivery targets, inspection, and explicit deletion |
+| [`tool-schedule/`](tool-schedule/README.md) | Preset-scoped `schedule_create`, `schedule_list`, `schedule_view`, and `schedule_edit` tools over the Host `ctx.schedule` service |
 
 -----
 
 <a id="related-documentation"></a>
 ## Related documentation
 
-- [Session-local Schedule subsystem](../../docs/subsystems/schedule.md) — durable record, transition, view, and delivery contracts.
-- [Generated tool catalog](../../docs/tool-catalog.md#deepseek-aidsh-schedule) — the `schedule_create`/`schedule_list`/`schedule_delete` schemas the model receives.
-- [Schedule user guide](../../docs/user/guide/schedule.md) — the official configuration path for mounting the package.
+- [Schedule subsystem](../../docs/subsystems/schedule.md) — task records, recurrence rules, delivery targets, latest receipts, and delivery contracts.
+- [Generated tool catalog](../../docs/tool-catalog.md#deepseek-aidsh-tool-schedule) — the `schedule_create`/`schedule_list`/`schedule_view`/`schedule_edit` schemas a mounting preset contributes.
+- [Schedule user guide](../../docs/user/guide/schedule.md) — create, inspect, run, edit, and delete scheduled tasks.
+- [Automation tasks page](../client/ui-schedule/README.md) — the sidebar page that manages every Host task in the browser.
 
 -----
 

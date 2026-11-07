@@ -24,9 +24,6 @@
       "path": "../../context/session-reference"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
-    },
-    {
       "path": "../../typert/protocol"
     },
     {
@@ -36,7 +33,7 @@
       "path": "../connection/tsconfig.client.json"
     },
     {
-      "path": "../locale"
+      "path": "../locale/tsconfig.client.json"
     },
     {
       "path": "../ui-input-trigger"
@@ -45,7 +42,16 @@
       "path": "../ui-primitives"
     },
     {
+      "path": "../ui-conversation/tsconfig.client.json"
+    },
+    {
+      "path": "../ui-renderer"
+    },
+    {
       "path": "../ui-slots"
+    },
+    {
+      "path": "../ui-sidebar-right"
     }
   ]
 }

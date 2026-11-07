@@ -81,7 +81,10 @@ describe('write-intent decision', () => {
 describe('edit-intent decision', () => {
   it('rejects an unread edit with FS_NOT_OBSERVED', async () => {
     const { ctx } = await setup()
-    await expect(editIntent(ctx, target('a.txt'), ownerExec({}))).rejects.toMatchObject({ code: 'FS_NOT_OBSERVED' })
+    await expect(editIntent(ctx, target('a.txt'), ownerExec({}))).rejects.toMatchObject({
+      code: 'FS_NOT_OBSERVED',
+      message: 'edit requires reading "a.txt" first',
+    })
   })
 
   it('rejects an edit with no owner (cannot prove prior observation)', async () => {
@@ -232,5 +235,22 @@ describe('disposal releases recorded state (HMR safety)', () => {
     await fiber.dispose()
     // With no listener, the waterfall falls through to the bare default.
     expect(await writeIntent(ctx, target('a.txt'), ownerExec({}))).toBeUndefined()
+  })
+})
+
+describe('delete-intent decision', () => {
+  it('rejects unseen and absent sources, returns a present version, and releases its listener on disposal', async () => {
+    const { ctx, fiber } = await setup()
+    const actor = ownerExec({})
+    const t = target('a')
+    const intent = () => ctx.waterfall('fs/delete-intent', t, actor, () => undefined)
+    try {
+      await expect(intent()).rejects.toMatchObject({ code: 'FS_NOT_OBSERVED', message: 'delete requires reading "a" first' })
+      ctx.emit('fs/observed', t, absent, actor)
+      await expect(intent()).rejects.toMatchObject({ code: 'FS_NOT_FOUND', message: 'cannot delete "a": not found' })
+      ctx.emit('fs/observed', t, present('v7'), actor)
+      expect(await intent()).toEqual({ version: 'v7' })
+    } finally { await fiber.dispose() }
+    expect(await intent()).toBeUndefined()
   })
 })

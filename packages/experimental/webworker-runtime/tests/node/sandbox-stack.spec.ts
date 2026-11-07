@@ -4,10 +4,18 @@ import { Context } from '@deepseek-ai/cordis'
 import { SandboxBashExecutor } from '@deepseek-ai/dsh-bash-sandbox'
 import LocalSandboxProvider from '@deepseek-ai/dsh-sandbox-local'
 import { SandboxPolicyService } from '@deepseek-ai/dsh-sandbox-policy'
+import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 import { MemoryVfs } from '../../src/storage/memory.ts'
 import { setActiveVfs } from '../../src/storage/active.ts'
 import { processAlive, signalProcess } from '../../src/node/process-table.ts'
+import type { ShellExecSpec, ShellExecution, ShellRunResult } from '@deepseek-ai/dsh-shell'
+
+/** Historical foreground shorthand over the unified execute() seam. */
+async function run(x: { execute(spec: ShellExecSpec): Promise<ShellExecution> }, spec: ShellExecSpec): Promise<ShellRunResult> {
+  return (await x.execute(spec)).result()
+}
+
 
 vi.mock('node:child_process', async () => await import('../../src/node/builtin_modules/implemented/child_process.ts'))
 
@@ -44,6 +52,7 @@ async function setup(mode: 'read-only' | 'workspace-write' | 'danger-full-access
   const ctx = new Context()
   contexts.push(ctx)
   await ctx.plugin(LocalSandboxProvider)
+  await ctx.plugin(SessionProjectionRegistry)
   await ctx.plugin(SandboxPolicyService, { mode, workspaceRoot: WORKSPACE })
   await ctx.plugin(LocalSubprocessRuntime)
   await ctx.plugin(SandboxBashExecutor, { cwd: WORKSPACE })
@@ -53,14 +62,14 @@ async function setup(mode: 'read-only' | 'workspace-write' | 'danger-full-access
 describe('Worker Landlock through the production sandbox stack', () => {
   it('allows workspace and temp writes while classifying an outside write as denied', async () => {
     const bash = await setup('workspace-write')
-    const allowed = await bash.run(bash.resolve({
+    const allowed = await run(bash, bash.resolve({
       command: `echo workspace > ${WORKSPACE}/allowed.txt; echo temp > /tmp/allowed.txt`,
     }))
     expect(allowed.sandbox).toEqual({ mode: 'workspace-write', denied: false, enforcement: 'full' })
     expect(vfs.readFileSync(`${WORKSPACE}/allowed.txt`, 'utf8')).toBe('workspace\n')
     expect(vfs.readFileSync('/dsh/tmp/allowed.txt', 'utf8')).toBe('temp\n')
 
-    const denied = await bash.run(bash.resolve({ command: `echo denied > ${OUTSIDE}/denied.txt` }))
+    const denied = await run(bash, bash.resolve({ command: `echo denied > ${OUTSIDE}/denied.txt` }))
     expect(denied.exitCode).toBe(1)
     expect(denied.sandbox).toEqual({ mode: 'workspace-write', denied: true, enforcement: 'full' })
     expect(vfs.existsSync(`${OUTSIDE}/denied.txt`)).toBe(false)
@@ -68,24 +77,24 @@ describe('Worker Landlock through the production sandbox stack', () => {
 
   it('keeps read-only confined and danger-full-access unwrapped', async () => {
     const readOnly = await setup('read-only')
-    const strict = await readOnly.run(readOnly.resolve({
+    const strict = await run(readOnly, readOnly.resolve({
       command: `echo discarded > /dev/null; echo denied > ${WORKSPACE}/strict.txt`,
     }))
     expect(strict.sandbox).toEqual({ mode: 'read-only', denied: true, enforcement: 'full' })
     expect(vfs.existsSync(`${WORKSPACE}/strict.txt`)).toBe(false)
 
     const unrestricted = await setup('danger-full-access')
-    const result = await unrestricted.run(unrestricted.resolve({ command: `echo allowed > ${OUTSIDE}/full.txt` }))
+    const result = await run(unrestricted, unrestricted.resolve({ command: `echo allowed > ${OUTSIDE}/full.txt` }))
     expect(result.sandbox).toEqual({ mode: 'danger-full-access', denied: false })
     expect(vfs.readFileSync(`${OUTSIDE}/full.txt`, 'utf8')).toBe('allowed\n')
   })
 
   it('does not leak a concurrent command policy into another process', async () => {
     const bash = await setup('read-only')
-    const strict = bash.run(bash.resolve({
+    const strict = run(bash, bash.resolve({
       command: `sleep 0.02; echo denied > ${WORKSPACE}/strict.txt`,
     }))
-    const writable = bash.run(bash.resolve({
+    const writable = run(bash, bash.resolve({
       command: `echo allowed > ${WORKSPACE}/writable.txt`,
       sandboxPolicy: { mode: 'workspace-write', workspaceRoot: WORKSPACE },
     }))

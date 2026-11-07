@@ -6,13 +6,17 @@
     "tsBuildInfoFile": "lib/tsconfig.host.tsbuildinfo"
   },
   "files": [
+    "src/access.ts",
     "src/index.ts",
-    "src/invariant.ts",
+    "src/remote-error-codes.ts",
     "src/stream-protocol.ts",
     "src/stream-server.ts",
     "src/types.ts"
   ],
   "references": [
+    {
+      "path": "../../boot/cmdline"
+    },
     {
       "path": "../../../vendor/cosmokit"
     },
@@ -23,16 +27,19 @@
       "path": "../../../vendor/schemastery"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../../client/connection/tsconfig.host.json"
     },
     {
-      "path": "../../client/connection/tsconfig.host.json"
+      "path": "../remote-access/tsconfig.host.json"
     },
     {
       "path": "../../host/webserver"
     },
     {
       "path": "../../typert/protocol"
+    },
+    {
+      "path": "../../util/deque"
     },
     {
       "path": "../../util/timeout"

@@ -17,9 +17,9 @@ declare module '@deepseek-ai/cordis' {
 
   interface Events {
     /**
-     * Expert waterfall over the assembled sections, contexts, tools, and variables.
+     * Presentation waterfall over assembled sections, contexts, and variables.
      * Scope-filtered dispatch (`@deepseek-ai/dsh-scope`): scoped listeners
-     * receive only that scope's assemblies. The returned value is authoritative.
+     * receive only that scope's assemblies. The returned text is authoritative; tool declarations remain provider-owned.
      * A supplied signal controls only this explicit assembly request and must not
      * be retained to control later turns. A registered complete section is
      * restored after this waterfall, so listeners cannot add to or replace
@@ -28,7 +28,7 @@ declare module '@deepseek-ai/cordis' {
      * @param context - the caller's per-assembly context.
      * @mode waterfall
      */
-    'system-prompt/assemble'(this: Scoped<SystemPrompt>, assembly: PromptAssembly, context: AssembleContext, next: () => Promise<PromptAssembly>): Promise<PromptAssembly>
+    'system-prompt/assemble'(this: Scoped<SystemPrompt>, assembly: PromptPresentation, context: AssembleContext, next: () => Promise<PromptPresentation>): Promise<PromptPresentation>
     /**
      * Emitted when any prompt provider changes. This registry notification is
      * unfiltered because a global change affects every scope.
@@ -55,16 +55,17 @@ export interface PromptSection {
   readonly name: string
   /**
    * Sections are concatenated in ascending order. Equal orders use code-unit
-   * name order. Repository-owned placements use
-   * {@link FIRST_PARTY_SECTION_ORDER}.
+   * name order.
    */
   readonly order: number
   /**
    * Static text or a provider evaluated at each assembly with that assembly's
    * {@link AssembleContext}. The text may reference `{{variable}}`s — they are
-   * interpolated later, by {@link renderPrompt}.
+   * interpolated later, by {@link renderPrompt}, unless `interpolate` is false.
    */
   readonly text: string | ((context: AssembleContext) => string)
+  /** Whether to interpolate prompt variables. Defaults to true; false preserves literal text. */
+  readonly interpolate?: boolean
   /**
    * Treat this contribution as the complete system prompt. Assembly still
    * runs the cooperative waterfall so tools, contexts, and variables can be
@@ -80,8 +81,12 @@ export interface PromptContext {
   readonly name: string
   /** Contexts are joined in ascending order. */
   readonly order: number
-  /** Static text or a provider evaluated for each assembly. Empty text contributes nothing. */
+  /** Static text or a provider evaluated at assembly and admission refresh. Empty text contributes nothing. */
   readonly text: string | ((context: AssembleContext) => string)
+  /** Whether to interpolate prompt variables. Defaults to true; false preserves literal text. */
+  readonly interpolate?: boolean
+  /** Keep this operational context when optional runtime context is disabled. */
+  readonly required?: boolean
 }
 
 /** One section of an assembly: {@link PromptSection} with its text resolved. */
@@ -90,6 +95,8 @@ export interface AssembledSection {
   name: string
   /** The resolved (but not yet interpolated) section text. */
   text: string
+  /** Whether to interpolate prompt variables. Defaults to true; false preserves literal text. */
+  interpolate?: boolean
 }
 
 /** One resolved dynamic context contribution. */
@@ -98,6 +105,8 @@ export interface AssembledContext {
   name: string
   /** The resolved text before variable interpolation. */
   text: string
+  /** Whether to interpolate prompt variables. Defaults to true; false preserves literal text. */
+  interpolate?: boolean
 }
 
 /** Tool schemas visible in one assembly and their pre-restriction name set. */
@@ -109,29 +118,24 @@ export interface ToolProviderResult {
 }
 
 /**
- * Merge-extensible assembled model input. Sections and contexts remain
- * uninterpolated until rendered; tools are already in canonical order.
+ * Prompt text contributions that the assembly waterfall may transform.
+ * Sections and contexts remain uninterpolated until rendered; tool
+ * declarations are owned by their providers.
  */
-export interface PromptAssembly {
+export interface PromptPresentation {
   sections: AssembledSection[]
   contexts: AssembledContext[]
-  tools: ToolSchema[]
   variables: Record<string, string | undefined>
 }
 
-/**
- * Sparse integer placements for repository-owned prompt sections.
- *
- * Adjacent values differ by at least ten to keep the first-party groups sparse
- * and make accidental collisions mechanically detectable.
- * External plugins may use any finite order; equal orders are deterministic by
- * section name.
- */
-export const FIRST_PARTY_SECTION_ORDER = {
+/** Completed model inputs: the presentation plus tool declarations in canonical order. */
+export interface PromptAssembly extends PromptPresentation {
+  tools: ToolSchema[]
+}
+
+const SECTION_ORDERS = {
   HARNESS_IDENTITY: -1000,
-  HARNESS_SOURCE: -900,
-  WEB_SURFACE: -800,
-  DEPLOYMENT_PERSONA: 0,
+  DEPLOYMENT_PERSONA_PREFIX: 0,
   PLAN_POLICY: 500,
   TEAM_POLICY: 600,
   PTC_ONLY: 800,
@@ -141,6 +145,7 @@ export const FIRST_PARTY_SECTION_ORDER = {
   TOOL_READ: 1100,
   TOOL_WRITE: 1200,
   TOOL_EDIT: 1300,
+  TOOL_APPLY_PATCH: 1350,
   TOOL_GLOB: 1400,
   TOOL_GREP: 1500,
   TOOL_JOBS: 1600,
@@ -150,26 +155,49 @@ export const FIRST_PARTY_SECTION_ORDER = {
   TOOL_LSP: 2200,
   TOOL_SESSION_QUERY: 2300,
   TOOL_GOAL: 2400,
-  TOOL_CORDIS: 2500,
+  TOOL_SCHEDULE: 2500,
   TOOL_WORKFLOW: 2600,
   TOOL_RALPH: 2700,
   TOOL_SUBAGENT: 2800,
   TOOL_REPORT: 2900,
+  TOOL_COMPUTER_USE: 3000,
+  MCP_SERVERS: 3100,
   TOOLS_SDK: 5000,
   DELIVERABLE_FILE_REFERENCES: 9000,
   STRUCTURED_OUTPUT: 9900,
+  // Local paths and endpoints follow reusable instructions.
+  HARNESS_SOURCE: 10000,
+  WEB_SURFACE: 10100,
+  DEPLOYMENT_PERSONA_SUFFIX: 10200,
 } as const
 
+/** Name of a centrally allocated prompt-section position. */
+export type PromptSectionOrderName = keyof typeof SECTION_ORDERS
+
+const CONTEXT_ORDERS = {
+  WORKING_DIRECTORY: 100,
+  SANDBOX_POLICY: 110,
+  APPROVAL_POLICY: 115,
+  SUBAGENT_DELEGATION: 120,
+  TEAM_IDENTITY: 125,
+  // Process-specific paths and endpoints stay out of the cached system prompt.
+  HARNESS_SOURCE: 200,
+  WEB_SURFACE: 210,
+} as const
+
+/** Name of a centrally allocated runtime-context position. */
+export type PromptContextOrderName = keyof typeof CONTEXT_ORDERS
+
 /**
- * The deployment persona's section name and order. Exported because a
+ * The deployment persona prefix's section name. Exported because a
  * composition can replace this slot — an agent preset shadows the
  * deployment's persona with its own — and both sides naming the same section
  * is what makes the replacement work rather than duplicate.
  */
-export const PERSONA_SECTION = 'deployment:persona'
+export const PERSONA_PREFIX_SECTION = 'deployment:persona-prefix'
 
-/** Prompt order of the persona slot. */
-export const PERSONA_ORDER = FIRST_PARTY_SECTION_ORDER.DEPLOYMENT_PERSONA
+/** Deployment persona suffix section name shared by global and scoped contributions. */
+export const PERSONA_SUFFIX_SECTION = 'deployment:persona-suffix'
 
 /** Valid variable names: how they are written between the braces. */
 const VARIABLE_NAME = /^[a-z][a-z0-9_]*$/
@@ -233,17 +261,22 @@ function compareToolNames(a: ToolSchema, b: ToolSchema): number {
   return compareNames(a.name, b.name)
 }
 
-/** Plugin config: the deployment-authored fragment of the system prompt (see {@link Config.persona} for its contract). */
+/** Plugin config: the deployment-authored fragment of the system prompt (see {@link Config.personaPrefix} for its contract). */
 export interface Config {
   /** Include the fixed DeepSeek Harness identity before the deployment persona (default true). */
   includeHarnessIdentity?: boolean
-  /** Include dynamic runtime-context snapshots in model history (default true). */
+  /** Include optional runtime-context snapshots in model history (default true); required context remains. */
   includeRuntimeContext?: boolean
   /**
-   * Deployment-wide order-0 persona template. A scoped section named
-   * `deployment:persona` shadows it; `{{variable}}` references are strict.
+   * Deployment-wide persona prefix template before first-party guidance. A scoped section named
+   * `deployment:persona-prefix` shadows it; `{{variable}}` references are strict.
    */
-  persona?: string
+  personaPrefix?: string
+  /**
+   * Persona suffix template after first-party guidance. A scoped `deployment:persona-suffix`
+   * section shadows it; `{{variable}}` references are strict. Defaults to empty.
+   */
+  personaSuffix?: string
   /**
    * Model-facing tool names in order, with {@link TOOL_ORDER_REST} exactly once.
    * Invalid fields fail at load and unknown names fail at assembly; known names
@@ -254,7 +287,8 @@ export interface Config {
 
 /**
  * Interpolate strict `{{variable}}` references, drop empty sections, and join
- * the rest with blank lines. Malformed, unknown, or undefined references throw;
+ * the rest with blank lines. Sections with `interpolate: false` retain literal
+ * text. Malformed, unknown, or undefined references in other sections throw;
  * a lone `{{` without any later `}}` is literal prose, and substituted values
  * are not scanned again.
  * @param assembly - the assembly whose sections and variables to render.
@@ -262,13 +296,13 @@ export interface Config {
  */
 export function renderPrompt(assembly: PromptAssembly): string {
   return assembly.sections
-    .map(section => interpolate(section, assembly.variables, 'section'))
+    .map(section => section.interpolate === false ? section.text : interpolate(section, assembly.variables, 'section'))
     .filter(text => text.length > 0)
     .join('\n\n')
 }
 
 /**
- * Render the complete dynamic context snapshot.
+ * Render the complete dynamic context snapshot, preserving literal contributions.
  * @param assembly - the assembly whose contexts and variables to render.
  * @returns the current full snapshot, or `''` when no context is active.
  */
@@ -295,13 +329,17 @@ export function joinContextSections(sections: readonly ContextSnapshotSection[])
  *
  * {@link renderContextSnapshot} joins these for the model; a consumer that
  * presents the snapshot uses them to attribute each part to the subsystem that
- * contributed it, without re-splitting the joined prose.
+ * contributed it, without re-splitting the joined prose. Contributions with
+ * `interpolate: false` preserve literal text instead of resolving prompt variables.
  * @param assembly - the assembly whose contexts and variables to render.
  * @returns one entry per contributing context that rendered to non-empty text.
  */
 export function renderContextSections(assembly: PromptAssembly): ContextSnapshotSection[] {
   return assembly.contexts
-    .map(context => ({ name: context.name, text: interpolate(context, assembly.variables, 'context') }))
+    .map(context => ({
+      name: context.name,
+      text: context.interpolate === false ? context.text : interpolate(context, assembly.variables, 'context'),
+    }))
     .filter(section => section.text.length > 0)
 }
 
@@ -343,6 +381,15 @@ function interpolate(
     last = open + group[0].length
   }
   return result + text.slice(last)
+}
+
+/** Resolve one registered runtime fact without assembling sections or tools. */
+function resolveContext(entry: PromptContext, context: AssembleContext): AssembledContext {
+  return {
+    name: entry.name,
+    text: typeof entry.text === 'function' ? entry.text(context) : entry.text,
+    ...entry.interpolate !== undefined ? { interpolate: entry.interpolate } : {},
+  }
 }
 
 /** One tool-schema provider stored in a prompt layer. */
@@ -390,7 +437,8 @@ export class SystemPrompt extends Service {
   static Config: z<Config> = z.object({
     includeHarnessIdentity: z.boolean().default(true),
     includeRuntimeContext: z.boolean().default(true),
-    persona: z.string().default(''),
+    personaPrefix: z.string().default(''),
+    personaSuffix: z.string().default(''),
     // Preserve omission because an explicit empty order lacks the rest marker.
     toolOrder: z.array(z.string()).default(undefined as unknown as string[]),
   })
@@ -408,15 +456,20 @@ export class SystemPrompt extends Service {
     if (config.includeHarnessIdentity ?? true) {
       this.section({
         name: 'harness:identity',
-        order: FIRST_PARTY_SECTION_ORDER.HARNESS_IDENTITY,
+        order: this.getSectionOrder('HARNESS_IDENTITY'),
         text: 'You are an AI agent powered by DeepSeek Harness.',
       })
     }
     this.section({
-      name: PERSONA_SECTION,
-      order: PERSONA_ORDER,
+      name: PERSONA_PREFIX_SECTION,
+      order: this.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX'),
       // The fallback narrows the optional input type; the schema already defaults it.
-      text: config.persona ?? '',
+      text: config.personaPrefix ?? '',
+    })
+    this.section({
+      name: PERSONA_SUFFIX_SECTION,
+      order: this.getSectionOrder('DEPLOYMENT_PERSONA_SUFFIX'),
+      text: config.personaSuffix ?? '',
     })
     if (!(config.includeRuntimeContext ?? true)) this.suppressRuntimeContext()
   }
@@ -441,6 +494,24 @@ export class SystemPrompt extends Service {
   }
 
   /**
+   * Resolve the centrally owned placement of a repository prompt section.
+   * @param name - stable section placement name.
+   * @returns the section's numeric sort order.
+   */
+  getSectionOrder(name: PromptSectionOrderName): number {
+    return SECTION_ORDERS[name]
+  }
+
+  /**
+   * Resolve the centrally owned placement of a repository runtime context.
+   * @param name - stable context placement name.
+   * @returns the context's numeric sort order.
+   */
+  getContextOrder(name: PromptContextOrderName): number {
+    return CONTEXT_ORDERS[name]
+  }
+
+  /**
    * Register ordered dynamic context in the calling context's scope. Scoped
    * entries shadow global entries with the same name.
    * @param context - the context contribution to register.
@@ -458,7 +529,7 @@ export class SystemPrompt extends Service {
   }
 
   /**
-   * Suppress every dynamic runtime-context contribution in the calling
+   * Suppress optional dynamic runtime-context contributions in the calling
    * context's scope without changing the services that own or enforce those
    * facts. Multiple suppressors remain independently disposable.
    * @returns the exact Cordis effect disposer.
@@ -506,13 +577,45 @@ export class SystemPrompt extends Service {
   }
 
   /**
+   * Refresh accepted registered runtime facts for request admission. Contexts
+   * added only by the assembly waterfall retain their accepted values. Current
+   * suppression removes optional contexts, and missing required registrations
+   * are restored in registry order. Sections, tools, and interpolation variables
+   * retain the accepted assembly; their providers and waterfall do not rerun.
+   * @param assembly - accepted assembly for this scope and step.
+   * @param context - the same scope and current plugin-defined assembly fields.
+   * @returns the accepted assembly with current runtime-context provider text.
+   */
+  refreshContext(assembly: PromptAssembly, context: AssembleContext = {}): PromptAssembly {
+    const providers = this.layers.merge(context.scope, layer => layer.contexts)
+    const suppressed = !this.layers.global.runtimeContextSuppressors.isEmpty()
+      || this.layers.chainLayers(context.scope).some(layer => !layer.runtimeContextSuppressors.isEmpty())
+    const required = new Map([...providers].filter(([, entry]) => entry.required === true))
+    const contexts: AssembledContext[] = []
+    for (const accepted of assembly.contexts) {
+      const provider = providers.get(accepted.name)
+      required.delete(accepted.name)
+      if (suppressed && provider?.required !== true) continue
+      contexts.push(provider === undefined ? accepted : resolveContext(provider, context))
+    }
+    for (const provider of required.values()) {
+      const index = contexts.findIndex((entry) => {
+        const next = providers.get(entry.name)
+        return next !== undefined && next.order > provider.order
+      })
+      contexts.splice(index < 0 ? contexts.length : index, 0, resolveContext(provider, context))
+    }
+    return { ...assembly, contexts }
+  }
+
+  /**
    * Assemble global and scoped providers, detach tool parameters, apply
-   * canonical ordering, then run the assembly waterfall. Scoped sections and
-   * variables shadow globals. The returned waterfall value is authoritative
-   * except that an effective complete section is restored afterwards as the
-   * sole prompt section.
-   * @param context - the optional scope and plugin-defined assembly fields.
-   * @returns the post-waterfall assembly with any complete prompt enforced.
+   * canonical ordering, then run the presentation waterfall. Scoped sections
+   * and variables shadow globals. The waterfall's text is authoritative except
+   * that an effective complete section is restored afterwards as the sole
+   * prompt section; tool declarations stay provider-owned.
+   * @param context - the optional scope, step tool set, and plugin-defined assembly fields.
+   * @returns the post-waterfall assembly with ordered tool declarations and any complete prompt enforced.
    */
   // Keep configuration failures on the declared asynchronous error path.
   async assemble(context: AssembleContext = {}): Promise<PromptAssembly> {
@@ -543,10 +646,11 @@ export class SystemPrompt extends Service {
     const knownNames = new Set<string>()
     for (const provider of providers) {
       const result = provider(context)
-      const schemas = result.schemas.map(({ name, description, parameters }): ToolSchema => ({
+      const schemas = result.schemas.map(({ name, description, parameters, deferLoading }): ToolSchema => ({
         name,
         description,
         parameters: structuredClone(parameters),
+        ...deferLoading === true ? { deferLoading } : {},
       }))
       const acceptedKnownNames = result.knownNames ?? schemas.map(tool => tool.name)
       collected.push(...schemas)
@@ -563,32 +667,31 @@ export class SystemPrompt extends Service {
         const assembled = {
           name: section.name,
           text: typeof section.text === 'function' ? section.text(context) : section.text,
+          ...section.interpolate !== undefined ? { interpolate: section.interpolate } : {},
         }
         if (section.complete === true) completeSection = { ...assembled }
         return assembled
       })
-    const assembly: PromptAssembly = {
+    const tools = orderTools(collected, this.toolOrder, knownNames)
+    const assembly: PromptPresentation = {
       sections,
-      contexts: runtimeContextSuppressed
-        ? []
-        : [...contextByName.values()]
-          .sort((a, b) => a.order - b.order)
-          .map(entry => ({
-            name: entry.name,
-            text: typeof entry.text === 'function' ? entry.text(context) : entry.text,
-          })),
-      tools: orderTools(collected, this.toolOrder, knownNames),
+      contexts: [...contextByName.values()]
+        .filter(entry => !runtimeContextSuppressed || entry.required === true)
+        .sort((a, b) => a.order - b.order)
+        .map(entry => resolveContext(entry, context)),
       variables,
     }
     const transformed = await this.ctx.waterfall(
       scopeTarget(this, scope), 'system-prompt/assemble', assembly, context,
       () => Promise.resolve(assembly),
     )
-    if (completeSection === undefined && !runtimeContextSuppressed) return transformed
+    if (completeSection === undefined && !runtimeContextSuppressed) return { ...transformed, tools }
+    const requiredContexts = new Set([...contextByName.values()].filter(entry => entry.required === true).map(entry => entry.name))
     return {
       ...transformed,
+      tools,
       sections: completeSection === undefined ? transformed.sections : [completeSection],
-      contexts: runtimeContextSuppressed ? [] : transformed.contexts,
+      contexts: runtimeContextSuppressed ? transformed.contexts.filter(entry => requiredContexts.has(entry.name)) : transformed.contexts,
     }
   }
 }

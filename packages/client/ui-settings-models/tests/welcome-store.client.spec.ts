@@ -2,8 +2,10 @@ import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { SettingsSchemaService } from '@deepseek-ai/dsh-client-ui-settings/src/client/schema.ts'
 import { SettingsDescribeMirror } from '@deepseek-ai/dsh-client-ui-settings/src/client/settings-mirror.ts'
-import { SettingsScopeController } from '@deepseek-ai/dsh-client-ui-settings/src/client/settings-scope.ts'
-import { decodeWelcomeSection, WelcomeNoticeStore } from '../src/client/welcome-store.ts'
+import { ConfigFormController } from '@deepseek-ai/dsh-client-ui-settings/src/client/config-form.ts'
+import { RemoteError, TestRemote } from '@deepseek-ai/dsh-client-test-runtime'
+import { apply as applySettings, inject as settingsInject } from '@deepseek-ai/dsh-client-ui-settings/client'
+import { decodeWelcomeSection, WelcomeNoticeStore, type WelcomeSection } from '../src/client/welcome-store.ts'
 import {
   WELCOME_NOTICE_ACK_FIELD, WELCOME_NOTICE_SETTINGS_NAMESPACE, WELCOME_NOTICE_VERSION,
 } from '../src/onboarding-copy.ts'
@@ -15,12 +17,19 @@ function ok<T>(value: T) {
   return { ok: true as const, value }
 }
 
+function rejected(message: string) {
+  return {
+    ok: false as const,
+    error: new RemoteError('settings/rejected', message, { ns: WELCOME_NOTICE_SETTINGS_NAMESPACE }),
+  }
+}
+
 function namespace(value: unknown = {}, revision = 0) {
   return {
     ns: WELCOME_NOTICE_SETTINGS_NAMESPACE,
-    schema: {},
+    schema: { type: 'object', dict: { [WELCOME_NOTICE_ACK_FIELD]: { type: 'string', meta: {} } } },
     value,
-    applies: 'live' as const,
+    autoGenerate: true, applies: 'live' as const,
     secrets: [],
     revision,
   }
@@ -33,36 +42,19 @@ function acknowledgedNamespace(version: string, revision = 1) {
 /** The welcome store over a real mirror-derived scope and a fake wire. */
 function buildWelcome(
   api: { describe?: ReturnType<typeof vi.fn>; mutate?: ReturnType<typeof vi.fn> },
-  persistence: 'host' | 'memory' = 'host',
 ) {
-  const wire = { settings: api } as never
-  const mirror = new SettingsDescribeMirror(wire, persistence)
-  const scope = new SettingsScopeController(
-    wire,
+  const ctx = { remote: { settings: api } } as never
+  const mirror = new SettingsDescribeMirror(ctx)
+  const scope = new ConfigFormController(
+    ctx,
     { namespace: WELCOME_NOTICE_SETTINGS_NAMESPACE, decode: decodeWelcomeSection },
     mirror,
-    persistence,
     schemaService,
   )
   return { mirror, controller: new WelcomeNoticeStore(scope) }
 }
 
 describe('WelcomeNoticeStore', () => {
-  it('acknowledges in memory while Host settings persistence is disabled', async () => {
-    const describeCall = vi.fn()
-    const mutate = vi.fn()
-    const { controller } = buildWelcome({ describe: describeCall, mutate }, 'memory')
-
-    await controller.load()
-    expect(controller.store.getSnapshot()).toEqual({ status: 'ready', acknowledged: false, error: null })
-    await expect(controller.acknowledge()).resolves.toBe(true)
-    expect(controller.store.getSnapshot()).toEqual({ status: 'ready', acknowledged: true, error: null })
-    await controller.load()
-    expect(controller.store.getSnapshot()).toEqual({ status: 'ready', acknowledged: true, error: null })
-    expect(describeCall).not.toHaveBeenCalled()
-    expect(mutate).not.toHaveBeenCalled()
-  })
-
   it('acknowledges only the exact current copy version', async () => {
     for (const [version, acknowledged] of [
       [undefined, false],
@@ -100,6 +92,42 @@ describe('WelcomeNoticeStore', () => {
     expect(describeCall).toHaveBeenCalledTimes(1)
   })
 
+  it('retains acknowledgement when the settings plugin is recreated', async () => {
+    let stored = namespace({}, 3)
+    const ctx = new Context()
+    new TestRemote(ctx, {
+      settings: {
+        describe: vi.fn(async () => ok({ writable: true, hasDocument: false, namespaces: [stored] })),
+        mutate: vi.fn(async () => {
+          stored = acknowledgedNamespace(WELCOME_NOTICE_VERSION, 4)
+          return ok(stored)
+        }),
+      },
+    })
+    const plugin = { inject: [...settingsInject], apply: applySettings }
+    let controller: WelcomeNoticeStore | undefined
+    try {
+      const first = ctx.plugin(plugin)
+      await first.await()
+      await ctx.configForms.describe().ensure()
+      controller = new WelcomeNoticeStore(
+        ctx.configForms.get<WelcomeSection>(WELCOME_NOTICE_SETTINGS_NAMESPACE))
+      await controller.load()
+      await expect(controller.acknowledge()).resolves.toBe(true)
+      controller.dispose()
+      await first.dispose()
+      await ctx.plugin(plugin).await()
+      await ctx.configForms.describe().ensure()
+      controller = new WelcomeNoticeStore(
+        ctx.configForms.get<WelcomeSection>(WELCOME_NOTICE_SETTINGS_NAMESPACE))
+      await controller.load()
+      expect(controller.store.getSnapshot()).toMatchObject({ status: 'ready', acknowledged: true })
+    } finally {
+      controller?.dispose()
+      await ctx.fiber.dispose()
+    }
+  })
+
   it('keeps the notice pending while the settings read has not answered', async () => {
     const describeCall = vi.fn(() => Promise.reject(new Error('offline')))
     const { mirror, controller } = buildWelcome({ describe: describeCall })
@@ -109,11 +137,11 @@ describe('WelcomeNoticeStore', () => {
     expect(controller.store.getSnapshot()).toEqual({ status: 'loading', acknowledged: false, error: null })
   })
 
-  it('reports a failed or refused persistence attempt after its recovery read', async () => {
+  it('reports a refused persistence attempt after its recovery read', async () => {
     const describeCall = vi.fn(() => Promise.resolve(ok({
       writable: true, hasDocument: false, namespaces: [namespace()],
     })))
-    const mutate = vi.fn(() => Promise.reject(new Error('disk full')))
+    const mutate = vi.fn(() => Promise.resolve(rejected('the settings document is read-only')))
     const { mirror, controller } = buildWelcome({ describe: describeCall, mutate })
     await mirror.load()
     await controller.load()

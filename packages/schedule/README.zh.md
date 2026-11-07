@@ -1,15 +1,15 @@
 ---
-description: "schedule 组地图：基于会话日志的会话本地持久提醒，供浏览本组的用户与维护者阅读。"
+description: "schedule 包组：Host 拥有的计划任务、定时提醒与任务管理。"
 kind: "package-group"
 ---
 
-# schedule/ — 仅限会话内的提醒
+# schedule/ — Host 拥有的计划任务
 
 [English](README.md) | 中文
 
 ## 概述
 
-schedule 组为运行中的会话提供会话本地提醒：让 agent 在稍后、绝对时间或固定间隔提醒你，每条提醒到期时都会作为同一会话中的普通消息到达。它只包含一个包、三个工具——创建、列出与取消——没有自己的 UI 或服务接口。提醒在重启后依然存在，但只留在会话内部：没有电子邮件、短信或推送通知。本页是组的映射；包级约定由包 README 负责。
+创建投递到已有 Session 或新 Session 的 RFC 5545 重复任务，并在 Host 重启后保留它们。无需打开目标 Session，即可查看活动、已暂停和已结束的任务。Agent（智能体）使用 Schedule 工具、用户使用侧栏自动化任务页面创建、修改、暂停、恢复和删除任务；自动化任务页面还可以立即运行任务。到期任务作为普通 follow-up 消息进入其目标 Session，而不是电子邮件、短信或推送通知。
 
 ## 目录
 
@@ -22,18 +22,22 @@ schedule 组为运行中的会话提供会话本地提醒：让 agent 在稍后�
 <a id="packages"></a>
 ## 包
 
-| 包 | 职责 | ctx key |
-|---|---|---|
-| [`schedule/`](schedule/README.zh.md) | 会话本地提醒：安排一次性或固定间隔提醒、列出待处理项并取消；到期提醒以会话消息形式到达 | —（工具只注册在精确的 agent scope 中） |
+选择此包进行持久的计划任务管理。
+
+| 包 | 职责 |
+|---|---|
+| [`schedule/`](schedule/README.zh.md) | Host 拥有的任务持久化、调度、投递目标、查询与显式删除 |
+| [`tool-schedule/`](tool-schedule/README.zh.md) | 基于宿主 `ctx.schedule` 服务的 preset 级 `schedule_create`、`schedule_list`、`schedule_view` 和 `schedule_edit` 工具 |
 
 -----
 
 <a id="related-documentation"></a>
 ## 相关文档
 
-- [仅限会话内的 Schedule 子系统](../../docs/subsystems/schedule.zh.md)——持久记录、转换、视图与交付约定。
-- [生成的工具目录](../../docs/tool-catalog.zh.md#deepseek-aidsh-schedule)——模型接收的 `schedule_create`／`schedule_list`／`schedule_delete` schema。
-- [Schedule 用户指南](../../docs/user/guide/schedule.zh.md)——挂载本包的官方配置路径。
+- [Schedule 子系统](../../docs/subsystems/schedule.zh.md)——任务记录、重复规则、投递目标、最近一次回执与投递约定。
+- [生成的工具目录](../../docs/tool-catalog.zh.md#deepseek-aidsh-tool-schedule)——挂载 preset 所贡献的 `schedule_create`／`schedule_list`／`schedule_view`／`schedule_edit` schema。
+- [Schedule 用户指南](../../docs/user/guide/schedule.zh.md)——创建、查看、执行、修改和删除计划任务。
+- [自动化任务页面](../client/ui-schedule/README.zh.md)——在浏览器中管理宿主所有任务的侧栏页面。
 
 -----
 

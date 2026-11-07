@@ -9,28 +9,43 @@
   ],
   "references": [
     {
-      "path": "../../attachment/attachment"
+      "path": "../../../vendor/cordis"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../../attachment/attachment"
     },
     {
       "path": "../ui-renderer"
     },
     {
-      "path": "../ui-chat"
+      "path": "../ui-chat/tsconfig.client.json"
     },
     {
-      "path": "../ui-conversation"
+      "path": "../ui-conversation/tsconfig.client.json"
     },
     {
-      "path": "../ui-trajectory"
+      "path": "../ui-tool"
+    },
+    {
+      "path": "../ui-trajectory/tsconfig.client.json"
     },
     {
       "path": "../ui-slots"
     },
     {
       "path": "../ui-primitives"
+    },
+    {
+      "path": "../locale/tsconfig.client.json"
+    },
+    {
+      "path": "../ui-file-drag"
+    },
+    {
+      "path": "../../util/file-drag"
+    },
+    {
+      "path": "../ui-context-menu"
     }
   ]
 }

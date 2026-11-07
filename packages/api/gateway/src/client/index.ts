@@ -5,6 +5,8 @@
  */
 
 import { Service } from '@deepseek-ai/cordis'
+import { RemoteError, isRemoteUplinkItem, remoteErrorOf } from '@deepseek-ai/dsh-typert-protocol'
+export type { TypertGatewayFaultDetails } from '../remote-error-codes.ts'
 import type { Context } from '@deepseek-ai/cordis'
 import type {
   ConnectionHandle,
@@ -13,15 +15,17 @@ import type {
   InvocationDescriptor,
   TypertClientEventListener,
   TypertClientRemote,
+  RemoteFailure,
   RemoteResult,
+  RemoteStreamHandle,
   TypertCodec,
   TypertDisposer,
   TypertRemoteContribution,
   TypertRemoteEvent,
 } from '@deepseek-ai/dsh-typert-protocol'
 import {
+  ClientUplinkQueue,
   RemoteStreamCarrierError,
-  RemoteStreamError,
   RemoteStreamMuxClient,
 } from './stream-client.ts'
 import { ClientRemoteEvents } from './remote-events.ts'
@@ -30,7 +34,7 @@ import {
   type RemoteStreamOptions,
 } from './remote-stream.ts'
 
-export { RemoteStreamCarrierError, RemoteStreamError } from './stream-client.ts'
+export { RemoteStreamCarrierError } from './stream-client.ts'
 export { RemoteJournalStream } from './journal-stream.ts'
 export type {
   RemoteJournalChange,
@@ -51,7 +55,6 @@ interface MountToken {
 interface ScopedProjection {
   readonly context: string
   readonly wire: string
-  readonly codec: TypertCodec
   readonly parameterIndex?: number
 }
 
@@ -99,11 +102,26 @@ interface InstalledMethod {
 /** Typed Remote service augmented by generated direct namespaces and Gateway stream supervision. */
 export interface ClientRemote extends TypertClientRemote {
   /**
-   * Create one independently cancellable, reconnecting logical stream.
+   * Create an independently cancellable, reconnecting logical stream.
+   * Requires interactions=answer; passive Clients use generated stream methods.
    * @param options - domain-owned opener and generation-end classification.
    * @returns a single-consumer stream annotated with physical generation ids.
    */
   $stream<Item>(options: RemoteStreamOptions<Item>): RemoteStream<Item>
+  /**
+   * Fixed Host facts as plain reads: no store, no subscription, no generation
+   * counter. `home` stays undefined until the first ready frame and reflects
+   * the latest one afterwards.
+   */
+  readonly $host: RemoteHostFacts
+}
+
+/** The fixed Host facts exposed on `ctx.remote.$host`. */
+export interface RemoteHostFacts {
+  /** Host home directory from the ready frame, undefined before it. */
+  readonly home: string | undefined
+  /** Whether the carrier connects to the local Host. */
+  readonly isLoopback: boolean
 }
 
 declare module '@deepseek-ai/cordis' {
@@ -128,8 +146,9 @@ class ClientRemoteService extends Service implements ClientRemote {
   private readonly ownerCtx: Context
   private readonly connection: ConnectionHandle
   private readonly namespaces = new Map<string, RemoteNamespaceHandle>()
-  private readonly streams = new RemoteStreamMuxClient()
-  private readonly events: ClientRemoteEvents
+  private hostFacts: RemoteHostFacts | undefined
+  private readonly streams: RemoteStreamMuxClient
+  private readonly events: ClientRemoteEvents | undefined
   private mutations = Promise.resolve()
 
   constructor(ctx: Context) {
@@ -137,18 +156,30 @@ class ClientRemoteService extends Service implements ClientRemote {
     this.ownerCtx = ctx
     const connection = ctx.get('connection') as ConnectionHandle
     this.connection = connection
-    this.events = new ClientRemoteEvents(
-      ctx,
-      connection,
-      (endpoint, payload, signal) => this.openRemoteStream(endpoint, payload, signal),
+    this.streams = new RemoteStreamMuxClient(
+      path => connection.openWebSocket(path),
+      connection.interactions === 'answer',
     )
+    if (connection.interactions === 'answer') {
+      this.events = new ClientRemoteEvents(
+        ctx,
+        connection,
+        (endpoint, payload, signal) => this.openRemoteStream(endpoint, payload, signal),
+      )
+    }
+    // API callers retain a lifecycle socket even when they do not receive events.
+    // HTTP dispatch never waits for this independent connection attempt.
     if (connection.rpc.open === undefined) this.streams.start()
     let disposed = false
     let loop: ReturnType<ConnectionHandle['start']> | undefined
     const start = (): void => {
-      if (disposed) return
+      if (disposed || connection.interactions === 'none') return
+      if (connection.rpc.open === undefined) this.streams.start()
       loop = connection.start({
         onConnected: () => { this.ownerCtx.emit('connection/reset') },
+        onReconnectRequested: () => {
+          if (connection.rpc.open === undefined) this.streams.reconnect()
+        },
       })
     }
     const loader = ctx.get('loader') as LoaderReadiness | undefined
@@ -157,13 +188,27 @@ class ClientRemoteService extends Service implements ClientRemote {
     ctx.effect(() => async () => {
       disposed = true
       loop?.stop()
-      await this.events.dispose()
+      await this.events?.dispose()
       await this.streams.close()
     }, 'api-gateway.client.transport')
   }
 
   $stream<Item>(options: RemoteStreamOptions<Item>): RemoteStream<Item> {
+    if (this.connection.interactions === 'none') {
+      throw new Error('client api: $stream requires interactions=answer; use a generated stream method')
+    }
     return new RemoteStream(this.connection, options)
+  }
+
+  get $host(): RemoteHostFacts {
+    // Identity-stable: readers (useSyncExternalStore snapshots, memo inputs)
+    // compare by reference, so a fresh object is minted only when the fact
+    // itself changed. isLoopback is fixed for the page lifetime.
+    const home = this.connection.generation.getSnapshot()?.host.home
+    if (this.hostFacts === undefined || this.hostFacts.home !== home) {
+      this.hostFacts = { home, isLoopback: this.connection.isLoopback }
+    }
+    return this.hostFacts
   }
 
   async $mount(contribution: TypertRemoteContribution): ReturnType<TypertClientRemote['$mount']> {
@@ -180,6 +225,7 @@ class ClientRemoteService extends Service implements ClientRemote {
     event: Event,
     listener: TypertClientEventListener<Event>,
   ): () => void {
+    if (this.events === undefined) throw new Error('client api: forwarded events require interactions=answer')
     return this.events.subscribe(this.ctx, event, listener)
   }
 
@@ -188,13 +234,14 @@ class ClientRemoteService extends Service implements ClientRemote {
     endpoint: string,
     payload: unknown,
     signal: AbortSignal,
+    uplink?: AsyncIterable<unknown>,
     noConnection = `client api: ${endpoint} has no active Connection`,
   ): AsyncIterable<unknown> {
     const connection = this.ownerCtx.get('connection') as ConnectionHandle | undefined
     if (connection === undefined) throw new Error(noConnection)
-    const local = connection.rpc.open?.('/api', endpoint, payload, signal)
+    const local = connection.rpc.open?.('/api', endpoint, payload, signal, uplink)
     return local === undefined
-      ? this.streams.open(endpoint, payload, signal)
+      ? this.streams.open(endpoint, payload, signal, uplink)
       : normalizeConnectionStream(local)
   }
 
@@ -252,7 +299,7 @@ class ClientRemoteService extends Service implements ClientRemote {
       }
     }
     for (const descriptor of contribution.descriptors) {
-      requireStrictDescriptor(descriptor)
+      requireStrictInputs(descriptor)
       if (descriptor.invocation.kind === 'direct') add(direct, descriptor, 'direct')
       if (scopedProjection(descriptor) !== undefined) add(scoped, descriptor, 'scoped')
     }
@@ -356,7 +403,7 @@ class ClientRemoteService extends Service implements ClientRemote {
     scoped: ScopedMethod | undefined,
     callerCtx: Context,
     values: readonly unknown[],
-  ): Promise<RemoteResult<unknown>> | AsyncIterable<unknown> {
+  ): Promise<RemoteResult<unknown>> | RemoteStreamHandle<unknown, unknown> {
     if (scoped !== undefined) {
       const adapter = this.ownerCtx.typert.contexts.getClient(scoped.projection.context)
       const identity = adapter?.identity(callerCtx)
@@ -387,8 +434,8 @@ class ClientRemoteService extends Service implements ClientRemote {
     callerCtx: Context,
     values: readonly unknown[],
     boundIdentity?: BoundContextIdentity,
-  ): Promise<RemoteResult<unknown>> | AsyncIterable<unknown> {
-    if (descriptor.mode === 'stream') {
+  ): Promise<RemoteResult<unknown>> | RemoteStreamHandle<unknown, unknown> {
+    if (descriptor.mode !== undefined) {
       return this.invokeStream(descriptor, projection, token, callerCtx, values, boundIdentity)
     }
     return this.invoke(descriptor, projection, token, callerCtx, values, boundIdentity)
@@ -410,31 +457,43 @@ class ClientRemoteService extends Service implements ClientRemote {
     try {
       const result = await connection.rpc.call('/api', endpoint, { args: prepared.args }, prepared.signal)
       if (!mountActive(token)) return withdrawn(endpoint)
-      if (!result.ok) return { ok: false, error: result.error }
-      return { ok: true, value: result.value }
+      prepared.signal.throwIfAborted()
+      if (!result.ok) return { ok: false, error: rebuiltFailure(result.error) }
+      const value = descriptor.result.mode === 'strict' && descriptor.result.decode !== undefined
+        ? descriptor.result.decode(result.value)
+        : result.value
+      return { ok: true, value }
     } catch (error) {
       // Carrier throws (offline or abort) are outcomes of the call, not assembly
-      // faults, so they join the same error branch.
+      // faults, so they join the same error branch. A caller-aborted call is a
+      // cancellation even when the local throw wins the race against the wire
+      // round-trip, so it gets the same code the Host would have produced.
+      if (prepared.signal.aborted) return cancelledFailure(endpoint, error)
       return carrierFailure(endpoint, error)
     }
   }
 
-  private async *invokeStream(
+  /** Open the logical stream now and hand back its handle; `send()` before the first read queues behind the `open` frame. */
+  private invokeStream(
     descriptor: InvocationDescriptor,
     projection: ScopedProjection | undefined,
     token: MountToken,
     callerCtx: Context,
     values: readonly unknown[],
     boundIdentity?: BoundContextIdentity,
-  ): AsyncGenerator {
+  ): RemoteStreamHandle<unknown, unknown> {
     const endpoint = endpointOf(descriptor)
     if (!token.active) throw new Error(withdrawn(endpoint).error.message)
     const prepared = this.prepareInvocation(descriptor, projection, token, callerCtx, values, boundIdentity)
-    const stream = this.openRemoteStream(endpoint, { args: prepared.args }, prepared.signal)
-    for await (const value of stream) {
-      if (!mountActive(token)) throw new Error(withdrawn(endpoint).error.message)
-      yield value
-    }
+    const generation = new AbortController()
+    const uplink = new ClientUplinkQueue(endpoint)
+    const downlink = this.openRemoteStream(
+      endpoint,
+      { args: prepared.args },
+      AbortSignal.any([prepared.signal, generation.signal]),
+      uplink,
+    )
+    return new ClientStreamHandle(endpoint, downlink, uplink, generation, token)
   }
 
   private prepareInvocation(
@@ -470,12 +529,12 @@ class ClientRemoteService extends Service implements ClientRemote {
       if (identity === undefined) {
         throw new Error(`client api: ${endpoint} requires a ${JSON.stringify(projection.context)} Context`)
       }
-      args[projection.wire] = parseInput(projection.codec, identity, endpoint, projection.wire)
+      args[projection.wire] = identity
     }
     let valueIndex = 0
     descriptor.parameters.forEach((parameter, parameterIndex) => {
       if (parameterIndex === projection?.parameterIndex) return
-      const value = parseInput(parameter.codec, values[valueIndex], endpoint, parameter.wire)
+      const value = values[valueIndex]
       if (value !== undefined) args[parameter.wire] = value
       valueIndex += 1
     })
@@ -487,12 +546,94 @@ class ClientRemoteService extends Service implements ClientRemote {
   }
 }
 
+/**
+ * The handle a generated stream method returns: one generation of one logical
+ * stream. The downlink is iterated once; `send`/`end` feed the uplink queue the
+ * carrier pump drains; `dispose` aborts the generation and returns the carrier
+ * iterator, which sends `cancel` unless a terminal frame arrived, drops what was
+ * buffered, and ends the iteration quietly.
+ */
+class ClientStreamHandle implements RemoteStreamHandle<unknown, unknown> {
+  private readonly downlink: AsyncIterator<unknown>
+  private primed: Promise<IteratorResult<unknown>> | undefined
+  private consumed = false
+  private disposed = false
+
+  constructor(
+    private readonly endpoint: string,
+    downlink: AsyncIterable<unknown>,
+    private readonly uplink: ClientUplinkQueue,
+    private readonly generation: AbortController,
+    private readonly token: MountToken,
+  ) {
+    this.downlink = downlink[Symbol.asyncIterator]()
+    // The carrier opens the logical stream on the first pull; pulling now puts
+    // the `open` frame on the wire before any `send()`. The first read is kept
+    // for the consumer, and a failure waits for it instead of surfacing here;
+    // it also terminates the stream, so the queue closes and `send()` throws.
+    this.primed = this.downlink.next()
+    void this.primed.catch(() => { this.uplink.close() })
+  }
+
+  send(item: unknown): void {
+    if (!isRemoteUplinkItem(item)) throw new Error(`client api: ${this.endpoint} uplink item is not a lossless JSON value`)
+    this.uplink.push(item)
+  }
+
+  end(): void {
+    this.uplink.end()
+  }
+
+  dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
+    this.uplink.close()
+    this.generation.abort(new Error(`client api: ${this.endpoint} stream disposed`))
+    // Returning the carrier iterator reaches its `finally` even while nobody
+    // reads the downlink, so `cancel` goes out now and the pump stops.
+    void Promise.resolve(this.downlink.return?.()).catch(() => undefined)
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<unknown> {
+    if (this.consumed) throw new Error(`client api: ${this.endpoint} stream has one consumer`)
+    this.consumed = true
+    const iteration = this.iterate()
+    return {
+      next: () => iteration.next(),
+      // A return before the first read ends a generator that never started, so its `finally` would not dispose.
+      return: (value?: unknown) => {
+        this.dispose()
+        return iteration.return(value)
+      },
+    }
+  }
+
+  private async *iterate(): AsyncGenerator {
+    try {
+      while (true) {
+        const next = await (this.primed ?? this.downlink.next())
+        this.primed = undefined
+        if (this.disposed || next.done === true) return
+        if (!mountActive(this.token)) throw new Error(withdrawn(this.endpoint).error.message)
+        yield next.value
+      }
+    } catch (error) {
+      if (this.disposed) return
+      throw error
+    } finally {
+      // Ending early is a dispose; a terminated stream accepts no more uplink.
+      this.dispose()
+      await this.downlink.return?.()
+    }
+  }
+}
+
 type InvokeRemote = (
   direct: DirectMethod | undefined,
   scoped: ScopedMethod | undefined,
   callerCtx: Context,
   args: readonly unknown[],
-) => Promise<RemoteResult<unknown>> | AsyncIterable<unknown>
+) => Promise<RemoteResult<unknown>> | RemoteStreamHandle<unknown, unknown>
 
 class RemoteNamespaceService extends Service {
   private readonly methods = new Map<string, RemoteMethodRecord>()
@@ -638,7 +779,6 @@ function scopedProjection(descriptor: InvocationDescriptor): ScopedProjection | 
     return {
       context: descriptor.invocation.context,
       wire: descriptor.invocation.wire,
-      codec: descriptor.invocation.codec,
     }
   }
   if (descriptor.scope === undefined) return undefined
@@ -656,16 +796,16 @@ function scopedProjection(descriptor: InvocationDescriptor): ScopedProjection | 
   return {
     context: descriptor.scope.context,
     wire: descriptor.scope.wire,
-    codec: selected.parameter.codec,
     parameterIndex: selected.index,
   }
 }
 
-function requireStrictDescriptor(descriptor: InvocationDescriptor): void {
+function requireStrictInputs(descriptor: InvocationDescriptor): void {
   const endpoint = endpointOf(descriptor)
   for (const parameter of descriptor.parameters) {
     requireStrictCodec(parameter.codec, endpoint, parameter.wire)
   }
+  if (descriptor.uplink !== undefined) requireStrictCodec(descriptor.uplink.codec, endpoint, 'uplink')
   if (descriptor.invocation.kind === 'context') {
     requireStrictCodec(descriptor.invocation.codec, endpoint, descriptor.invocation.wire)
   }
@@ -677,28 +817,58 @@ function requireStrictCodec(codec: TypertCodec, endpoint: string, field: string)
   }
 }
 
-function parseInput(codec: TypertCodec, value: unknown, endpoint: string, field: string): unknown {
-  if (codec.mode !== 'strict') {
-    throw new Error(`client api: generated Remote ${endpoint} field ${JSON.stringify(field)} has no strict codec`)
-  }
-  try {
-    return codec.schema.parse(value)
-  } catch (cause) {
-    throw new Error(`client api: ${endpoint} rejected ${JSON.stringify(field)}`, { cause })
-  }
-}
-
 /** The namespace retired before or during the call, so no request outcome exists. */
 function withdrawn(endpoint: string): Extract<RemoteResult<never>, { readonly ok: false }> {
   return internalFailure(`client api: Remote method ${endpoint} is no longer mounted`)
 }
 
-function carrierFailure(endpoint: string, error: unknown): Extract<RemoteResult<never>, { readonly ok: false }> {
+/**
+ * The error branch a carrier throw (offline, transport fault) folds into: `gateway/internal` naming the endpoint and
+ * the thrown message. Exported so a stand-in for this face folds identically.
+ * @param endpoint - `<namespace>/<method>` that was called.
+ * @param error - what the carrier threw.
+ * @returns the failed result.
+ */
+export function carrierFailure(endpoint: string, error: unknown): Extract<RemoteResult<never>, { readonly ok: false }> {
   return internalFailure(`client api: ${endpoint} failed: ${error instanceof Error ? error.message : String(error)}`)
 }
 
+/**
+ * The error branch a call aborted by its caller folds into: `gateway/cancelled` with the carrier's throw as `cause`.
+ * @param endpoint - `<namespace>/<method>` that was called.
+ * @param cause - what the carrier threw when the signal aborted.
+ * @returns the failed result.
+ */
+export function cancelledFailure(endpoint: string, cause: unknown): Extract<RemoteResult<never>, { readonly ok: false }> {
+  return {
+    ok: false,
+    error: new RemoteError('gateway/cancelled', `client api: Remote invocation "${endpoint}" was aborted`, {}, { cause }),
+  }
+}
+
 function internalFailure(message: string): Extract<RemoteResult<never>, { readonly ok: false }> {
-  return { ok: false, error: { code: 'internal', message, details: {} } }
+  return { ok: false, error: new RemoteError('gateway/internal', message, {}) }
+}
+
+/**
+ * Whether a caught value is a Remote failure this face delivered or threw.
+ * The one consumer-facing discrimination point: marked instances carry their
+ * Host code; anything else is a local fault the caller should let crash.
+ * @param error - a caught value.
+ * @returns true when the value narrows to RemoteFailure.
+ */
+export function isRemoteFailure(error: unknown): error is RemoteFailure {
+  return remoteErrorOf(error) !== undefined
+}
+
+/**
+ * Rebuild the wire failure as a local RemoteError instance so the error branch
+ * carries a real Error and `throw result.error` keeps throw semantics. The code
+ * is passed through verbatim without runtime validation: a code outside this
+ * Client's merged map still surfaces as-is, so a newer Host stays readable.
+ */
+function rebuiltFailure(error: { code: string; message: string; details: object }): RemoteFailure {
+  return new RemoteError(error.code as never, error.message, error.details as never)
 }
 
 type MarkedConnectionStreamFailure = Error & {
@@ -715,7 +885,7 @@ async function *normalizeConnectionStream(source: AsyncIterable<unknown>): Async
     if (!(error instanceof Error)) throw error
     const marker = (error as MarkedConnectionStreamFailure).dshRemoteStreamFailure
     if (marker?.kind === 'remote') {
-      throw new RemoteStreamError(marker.code, error.message, marker.details)
+      throw new RemoteError(marker.code as never, error.message, marker.details as never)
     }
     if (marker?.kind === 'carrier') {
       throw new RemoteStreamCarrierError(error.message, { cause: error })

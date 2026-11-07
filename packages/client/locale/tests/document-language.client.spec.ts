@@ -27,7 +27,7 @@ async function bench(preference?: string) {
     ns: LOCALE_SETTINGS_NAMESPACE,
     schema: LocaleSettingsSchema.toJSON(),
     value: stored === undefined ? {} : { preference: stored },
-    applies: 'live' as const,
+    autoGenerate: true, applies: 'live' as const,
     secrets: [],
     revision,
   })
@@ -40,7 +40,6 @@ async function bench(preference?: string) {
     revision += 1
     return { ok: true as const, value: namespace() }
   })
-  ctx.provide('connection', { api: {}, isLoopback: true } as never)
   // The settings transport and the forwarded-event port the plugin injects.
   new TestRemote(ctx, { settings: { describe: describeRpc, mutate } })
   await ctx.plugin({ inject: [...settingsInject], apply: settingsApply }).await()
@@ -97,5 +96,22 @@ describe('document language', () => {
     locale.addLanguage({ id: 'pt-BR', label: 'Português', fallback: 'en' })
     locale.setLocale('pt-BR')
     expect(langOf()).toBe('pt-BR')
+  })
+
+  it('does not rewrite the document language for catalog changes with the same active locale', async () => {
+    const { locale } = await bench()
+    const observer = new MutationObserver(() => {})
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['lang'] })
+    try {
+      const remove = locale.addLanguage({ id: 'it', label: 'Italiano', fallback: 'en' })
+      expect(observer.takeRecords()).toHaveLength(0)
+      remove()
+      expect(observer.takeRecords()).toHaveLength(0)
+      locale.setLocale('en')
+      expect(observer.takeRecords()).toHaveLength(1)
+      expect(langOf()).toBe('en')
+    } finally {
+      observer.disconnect()
+    }
   })
 })

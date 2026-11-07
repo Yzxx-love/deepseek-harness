@@ -5,7 +5,7 @@
   align-items: center;
   gap: 8px;
   padding: 16px 0;
-  border-bottom: 1px solid var(--dsw-alias-border-l2);
+  border-bottom: 0.5px solid var(--dsw-alias-border-l2);
 }
 
 .rowText {
@@ -15,6 +15,14 @@
   flex-direction: column;
   gap: 4px;
   padding-right: 48px;
+}
+
+/* Narrow settings panel: the 48px gutter separates the label from its control
+   across a wide row and only squeezes the label here. */
+@media (max-width: 767px) {
+  :global(html:not([data-windows-titlebar]):not([data-platform='darwin'])) .rowText {
+    padding-right: 16px;
+  }
 }
 
 .title {
@@ -38,7 +46,7 @@
   height: 36px;
   padding: 0 14px;
   border: none;
-  border-radius: 18px;
+  border-radius: var(--dsw-radius-md);
   background: var(--dsw-alias-bg-module-platform);
   font: inherit;
   font-size: 14px;
@@ -47,8 +55,10 @@
   cursor: pointer;
 }
 
-.selector:hover:not(:disabled) {
-  background: var(--dsw-alias-interactive-bg-hover);
+@media (hover: hover) {
+  .selector:hover:not(:disabled) {
+    background: var(--dsw-alias-interactive-bg-hover);
+  }
 }
 
 .selector:disabled {

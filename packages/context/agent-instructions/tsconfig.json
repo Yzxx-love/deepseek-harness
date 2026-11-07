@@ -33,7 +33,7 @@
       "path": "../../util/home-paths"
     },
     {
-      "path": "../../runtime-diagnostics/invariants"
+      "path": "../../session/working-directory"
     }
   ]
 }
